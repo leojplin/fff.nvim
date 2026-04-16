@@ -1,3 +1,5 @@
+use fff::FFFQuery;
+use fff::FileItem;
 /// FFF vs ripgrep comparison benchmark
 ///
 /// Demonstrates why a persistent in-process search engine (fff) is fundamentally
@@ -19,9 +21,7 @@
 /// Usage:
 ///   cargo build --release --bin grep_vs_rg
 ///   ./target/release/grep_vs_rg [--path /path/to/repo] [--iters 5]
-use fff::grep::{grep_search, parse_grep_query, GrepSearchOptions};
-use fff::FFFQuery;
-use fff::FileItem;
+use fff::grep::{GrepSearchOptions, grep_search, parse_grep_query};
 use std::io::Read;
 use std::path::Path;
 use std::process::Command;
@@ -30,10 +30,11 @@ use std::time::{Duration, Instant};
 /// Number of times each query is repeated (overridable with --iters).
 const DEFAULT_ITERS: usize = 5;
 
-fn load_files(base_path: &Path) -> Vec<FileItem> {
+fn load_files(base_path: &Path) -> (Vec<FileItem>, *const u8) {
     use ignore::WalkBuilder;
 
     let mut files = Vec::new();
+    let mut rel_paths = Vec::new();
     WalkBuilder::new(base_path)
         .hidden(false)
         .git_ignore(true)
@@ -51,23 +52,19 @@ fn load_files(base_path: &Path) -> Vec<FileItem> {
             let size = entry.metadata().ok().map_or(0, |m| m.len());
             let is_binary = detect_binary(&path, size);
 
-            let path_string = path.to_string_lossy().into_owned();
-            let relative_start = (path_string.len() - relative_path.len()) as u16;
-            let filename_start = path_string
-                .rfind('/')
-                .map(|i| i + 1)
-                .unwrap_or(relative_start as usize) as u16;
-            files.push(FileItem::new_raw(
-                &path_string,
-                relative_start,
-                filename_start,
-                size,
-                0,
-                None,
-                is_binary,
-            ));
+            let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+            files.push(FileItem::new_raw(filename_start, size, 0, None, is_binary));
+            rel_paths.push(relative_path);
         });
-    files
+
+    let (store, strings) =
+        fff::simd_path::build_chunked_path_store_from_strings(&rel_paths, &files);
+    let arena = store.arena_base_ptr();
+    for (i, file) in files.iter_mut().enumerate() {
+        file.set_path(strings[i].clone());
+    }
+    std::mem::forget(store);
+    (files, arena)
 }
 
 fn detect_binary(path: &Path, size: u64) -> bool {
@@ -200,7 +197,12 @@ fn bytecount(bytes: &[u8], needle: u8) -> usize {
 }
 
 /// fff full: collects all GrepMatch structs (what the UI uses).
-fn run_fff_full(files: &[FileItem], query: &str, base_path: &Path) -> (usize, Duration) {
+fn run_fff_full(
+    files: &[FileItem],
+    query: &str,
+    base_path: &Path,
+    arena: *const u8,
+) -> (usize, Duration) {
     let parsed = parse_grep_query(query);
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
@@ -225,6 +227,7 @@ fn run_fff_full(files: &[FileItem], query: &str, base_path: &Path) -> (usize, Du
         None,
         None,
         base_path,
+        arena,
     );
     let elapsed = start.elapsed();
     (result.matches.len(), elapsed)
@@ -235,6 +238,7 @@ fn benchmark_fff_smart_case(
     files: &[FileItem],
     parsed: &FFFQuery<'_>,
     base_path: &Path,
+    arena: *const u8,
 ) -> (usize, Duration) {
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
@@ -259,13 +263,19 @@ fn benchmark_fff_smart_case(
         None,
         None,
         base_path,
+        arena,
     );
     let elapsed = start.elapsed();
     (result.matches.len(), elapsed)
 }
 
 /// fff paginated: first 50 results only (real UI scenario).
-fn run_fff_page(files: &[FileItem], query: &str, base_path: &Path) -> (usize, Duration) {
+fn run_fff_page(
+    files: &[FileItem],
+    query: &str,
+    base_path: &Path,
+    arena: *const u8,
+) -> (usize, Duration) {
     let parsed = parse_grep_query(query);
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
@@ -290,6 +300,7 @@ fn run_fff_page(files: &[FileItem], query: &str, base_path: &Path) -> (usize, Du
         None,
         None,
         base_path,
+        arena,
     );
     let elapsed = start.elapsed();
     (result.matches.len(), elapsed)
@@ -379,13 +390,13 @@ fn main() {
     eprintln!();
 
     eprintln!("[1/5] Indexing files...");
-    let files = load_files(&canonical);
+    let (files, arena) = load_files(&canonical);
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     eprintln!("  {} files ({} searchable)\n", files.len(), non_binary);
 
     eprintln!("[2/5] Warming caches (fff mmap + OS page cache)...");
     for q in &["return", "mutex", "struct", "include", "if", "int"] {
-        let _ = run_fff_page(&files, q, &canonical);
+        let _ = run_fff_page(&files, q, &canonical, arena);
         let _ = run_rg_count(&canonical, q, true, threads);
     }
     eprintln!("  mmap cache: warmed\n");
@@ -428,7 +439,7 @@ fn main() {
     for (name, query, ci) in &queries {
         let q = *query;
         let ci = *ci;
-        let fs = run_n(|| run_fff_full(&files, q, &canonical), iters);
+        let fs = run_n(|| run_fff_full(&files, q, &canonical, arena), iters);
         let rs = run_n(|| run_rg_lines(&canonical, q, ci, threads), iters);
 
         eprintln!(
@@ -476,7 +487,7 @@ fn main() {
     for (name, query, ci) in &queries {
         let q = *query;
         let ci = *ci;
-        let fs = run_n(|| run_fff_page(&files, q, &canonical), iters);
+        let fs = run_n(|| run_fff_page(&files, q, &canonical, arena), iters);
         let rs = run_n(|| run_rg_page(&canonical, q, ci, 50, threads), iters);
 
         eprintln!(

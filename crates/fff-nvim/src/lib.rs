@@ -216,6 +216,7 @@ pub fn fuzzy_search_files(
     let parsed = parser.parse(&query);
 
     let files = picker.get_files();
+    let arena = picker.arena_base_ptr();
     let results = FilePicker::fuzzy_search(
         files,
         &parsed,
@@ -231,7 +232,7 @@ pub fn fuzzy_search_files(
                 limit: page_size.unwrap_or(0),
             },
         },
-        picker.path_bigram_index(),
+        arena,
     );
 
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
@@ -255,14 +256,14 @@ pub fn fuzzy_search_files(
                     location: parsed.location,
                 };
 
-                return lua_types::SearchResultLua::from(found).into_lua(lua);
+                return lua_types::SearchResultLua::new(found, arena).into_lua(lua);
             }
 
             return build_file_path_fallback(lua, &path, results.total_files);
         }
     }
 
-    lua_types::SearchResultLua::from(results).into_lua(lua)
+    lua_types::SearchResultLua::new(results, arena).into_lua(lua)
 }
 
 #[allow(clippy::type_complexity)]
@@ -316,8 +317,9 @@ pub fn live_grep(
         trim_whitespace: trim_whitespace.unwrap_or(false),
     };
 
+    let arena = picker.arena_base_ptr();
     let result = picker.grep(&parsed, &options);
-    lua_types::GrepResultLua::from(result).into_lua(lua)
+    lua_types::GrepResultLua::new(result, arena).into_lua(lua)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but

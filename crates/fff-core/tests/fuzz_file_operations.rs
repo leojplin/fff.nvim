@@ -19,7 +19,7 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 
 use fff_search::file_picker::{FFFMode, FilePicker, FuzzySearchOptions};
-use fff_search::grep::{parse_grep_query, GrepMode, GrepSearchOptions};
+use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 use fff_search::{FilePickerOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
 
 const DOMAINS: &[&str] = &[
@@ -688,6 +688,7 @@ fn extract_stem(name: &str) -> String {
 }
 
 fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
+    let arena = picker.arena_base_ptr();
     let parser = QueryParser::default();
     let parsed = parser.parse(query);
     let result = FilePicker::fuzzy_search(
@@ -702,12 +703,12 @@ fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
             },
             ..Default::default()
         },
-        None,
+        arena,
     );
     result
         .items
         .iter()
-        .map(|f| f.relative_path().to_string())
+        .map(|f| f.relative_path(arena).to_string())
         .collect()
 }
 

@@ -72,6 +72,14 @@ fn main() {
 
     let files = get_files(&shared_picker).expect("Failed to get files");
 
+    let arena = {
+        let picker_guard = shared_picker.read().expect("Failed to acquire read lock");
+        picker_guard
+            .as_ref()
+            .expect("FilePicker not initialized")
+            .arena_base_ptr()
+    };
+
     // Test queries representing different search patterns
     let test_queries = vec![
         ("short_common", "mod", 100),
@@ -115,7 +123,7 @@ fn main() {
                         limit: 100,
                     },
                 },
-                None,
+                arena,
             );
 
             match_count += results.total_matched;

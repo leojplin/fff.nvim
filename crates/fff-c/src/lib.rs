@@ -294,6 +294,7 @@ pub unsafe extern "C" fn fff_search(
     let parser = QueryParser::default();
     let parsed = parser.parse(query_str);
 
+    let arena = picker.arena_base_ptr();
     let results = FilePicker::fuzzy_search(
         picker.get_files(),
         &parsed,
@@ -309,10 +310,10 @@ pub unsafe extern "C" fn fff_search(
                 limit: page_size,
             },
         },
-        picker.path_bigram_index(),
+        arena,
     );
 
-    let search_result = FffSearchResult::from_core(&results);
+    let search_result = FffSearchResult::from_core(&results, arena);
     FffResult::ok_handle(search_result as *mut c_void)
 }
 
@@ -394,8 +395,9 @@ pub unsafe extern "C" fn fff_live_grep(
         trim_whitespace: false,
     };
 
+    let arena = picker.arena_base_ptr();
     let result = picker.grep(&parsed, &options);
-    let grep_result = FffGrepResult::from_core(&result);
+    let grep_result = FffGrepResult::from_core(&result, arena);
     FffResult::ok_handle(grep_result as *mut c_void)
 }
 
@@ -496,6 +498,7 @@ pub unsafe extern "C" fn fff_multi_grep(
         trim_whitespace: false,
     };
 
+    let arena = picker.arena_base_ptr();
     let overlay_guard = picker.bigram_overlay().map(|o| o.read());
     let result = fff::multi_grep_search(
         picker.get_files(),
@@ -507,8 +510,9 @@ pub unsafe extern "C" fn fff_multi_grep(
         overlay_guard.as_deref(),
         None,
         picker.base_path(),
+        arena,
     );
-    let grep_result = FffGrepResult::from_core(&result);
+    let grep_result = FffGrepResult::from_core(&result, arena);
     FffResult::ok_handle(grep_result as *mut c_void)
 }
 

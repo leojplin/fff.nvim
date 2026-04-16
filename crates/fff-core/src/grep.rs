@@ -387,6 +387,7 @@ struct GrepContext<'a, 'b> {
     filtered_file_count: usize,
     budget: &'a ContentCacheBudget,
     base_path: &'a Path,
+    arena: crate::simd_path::ArenaPtr,
     prefilter: Option<&'a memchr::memmem::Finder<'b>>,
     prefilter_case_insensitive: bool,
     is_cancelled: Option<&'a AtomicBool>,
@@ -938,6 +939,7 @@ pub fn multi_grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     is_cancelled: Option<&AtomicBool>,
     base_path: &Path,
+    arena: *const u8,
 ) -> GrepResult<'a> {
     let total_files = files.len();
 
@@ -995,14 +997,14 @@ pub fn multi_grep_search<'a>(
     };
 
     let (mut files_to_search, mut filtered_file_count) =
-        prepare_files_to_search(files, constraints, options);
+        prepare_files_to_search(files, constraints, options, arena);
 
     // If constraints yielded 0 files and we had FilePath constraints,
     // retry without them (the path token was likely part of the search text).
     if files_to_search.is_empty()
         && let Some(stripped) = strip_file_path_constraints(constraints)
     {
-        let (retry_files, retry_count) = prepare_files_to_search(files, &stripped, options);
+        let (retry_files, retry_count) = prepare_files_to_search(files, &stripped, options, arena);
         files_to_search = retry_files;
         filtered_file_count = retry_count;
     }
@@ -1052,6 +1054,7 @@ pub fn multi_grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
+            arena: crate::simd_path::ArenaPtr::new(arena),
             prefilter: None, // no memmem prefilter for multi-pattern search
             prefilter_case_insensitive: false,
             is_cancelled,
@@ -1407,6 +1410,7 @@ fn prepare_files_to_search<'a>(
     files: &'a [FileItem],
     constraints: &[fff_query_parser::Constraint<'_>],
     options: &GrepSearchOptions,
+    arena: *const u8,
 ) -> (Vec<&'a FileItem>, usize) {
     let prefiltered: Vec<&FileItem> = if constraints.is_empty() {
         files
@@ -1414,7 +1418,7 @@ fn prepare_files_to_search<'a>(
             .filter(|f| !f.is_binary() && f.size > 0 && f.size <= options.max_file_size)
             .collect()
     } else {
-        match apply_constraints(files, constraints) {
+        match apply_constraints(files, constraints, arena) {
             Some(constrained) => constrained
                 .into_iter()
                 .filter(|f| !f.is_binary() && f.size > 0 && f.size <= options.max_file_size)
@@ -1499,6 +1503,7 @@ fn fuzzy_grep_search<'a>(
     budget: &ContentCacheBudget,
     is_cancelled: Option<&AtomicBool>,
     base_path: &Path,
+    arena: *const u8,
 ) -> GrepResult<'a> {
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" → "schema") costs ~1 typo with
@@ -1585,6 +1590,7 @@ fn fuzzy_grep_search<'a>(
     let search_start = std::time::Instant::now();
     let budget_exceeded = AtomicBool::new(false);
     let max_matches_per_file = options.max_matches_per_file;
+    let arena_ptr = crate::simd_path::ArenaPtr::new(arena);
 
     // Parallel phase with `map_init`: each rayon worker thread clones the
     // matcher once and gets a reusable read buffer. The buffer avoids
@@ -1800,6 +1806,7 @@ fn fuzzy_grep_search<'a>(
 /// When `query` is empty, returns git-modified/untracked files sorted by
 /// frecency for the "welcome state" UI.
 #[tracing::instrument(skip(files, options, budget, bigram_index, bigram_overlay, is_cancelled), fields(file_count = files.len()))]
+#[allow(clippy::too_many_arguments)]
 pub fn grep_search<'a>(
     files: &'a [FileItem],
     query: &FFFQuery<'_>,
@@ -1809,6 +1816,7 @@ pub fn grep_search<'a>(
     bigram_overlay: Option<&BigramOverlay>,
     is_cancelled: Option<&AtomicBool>,
     base_path: &Path,
+    arena: *const u8,
 ) -> GrepResult<'a> {
     let total_files = files.len();
 
@@ -1859,11 +1867,12 @@ pub fn grep_search<'a>(
         GrepMode::PlainText => None,
         GrepMode::Fuzzy => {
             let (mut files_to_search, mut filtered_file_count) =
-                prepare_files_to_search(files, constraints_from_query, options);
+                prepare_files_to_search(files, constraints_from_query, options, arena);
             if files_to_search.is_empty()
                 && let Some(stripped) = strip_file_path_constraints(constraints_from_query)
             {
-                let (retry_files, retry_count) = prepare_files_to_search(files, &stripped, options);
+                let (retry_files, retry_count) =
+                    prepare_files_to_search(files, &stripped, options, arena);
                 files_to_search = retry_files;
                 filtered_file_count = retry_count;
             }
@@ -1918,6 +1927,7 @@ pub fn grep_search<'a>(
                 budget,
                 is_cancelled,
                 base_path,
+                arena,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, options.smart_case)
@@ -2061,11 +2071,13 @@ pub fn grep_search<'a>(
         }
         _ => {
             // Constraints present or no bigram — full prepare then retain.
-            let (mut fts, mut fc) = prepare_files_to_search(files, constraints_from_query, options);
+            let (mut fts, mut fc) =
+                prepare_files_to_search(files, constraints_from_query, options, arena);
             if fts.is_empty()
                 && let Some(stripped) = strip_file_path_constraints(constraints_from_query)
             {
-                let (retry_files, retry_count) = prepare_files_to_search(files, &stripped, options);
+                let (retry_files, retry_count) =
+                    prepare_files_to_search(files, &stripped, options, arena);
                 fts = retry_files;
                 fc = retry_count;
             }
@@ -2113,6 +2125,7 @@ pub fn grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
+            arena: crate::simd_path::ArenaPtr::new(arena),
             prefilter: should_prefilter.then_some(&finder),
             prefilter_case_insensitive: case_insensitive,
             is_cancelled,
@@ -2316,25 +2329,25 @@ mod tests {
         let meta2 = std::fs::metadata(&file2_path).unwrap();
         let meta3 = std::fs::metadata(&file3_path).unwrap();
 
-        // Keep path strings alive alongside FileItems since path_ptr points into them.
-        let p1 = file1_path.to_string_lossy().into_owned();
-        let p2 = file2_path.to_string_lossy().into_owned();
-        let p3 = file3_path.to_string_lossy().into_owned();
-
-        let files = vec![
-            {
-                let rs = (p1.len() - "grep.rs".len()) as u16;
-                FileItem::new_raw(&p1, rs, rs, meta1.len(), 0, None, false)
-            },
-            {
-                let rs = (p2.len() - "matcher.rs".len()) as u16;
-                FileItem::new_raw(&p2, rs, rs, meta2.len(), 0, None, false)
-            },
-            {
-                let rs = (p3.len() - "other.rs".len()) as u16;
-                FileItem::new_raw(&p3, rs, rs, meta3.len(), 0, None, false)
-            },
-        ];
+        let paths = ["grep.rs", "matcher.rs", "other.rs"];
+        let sizes = [meta1.len(), meta2.len(), meta3.len()];
+        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let raw_items: Vec<FileItem> = paths
+            .iter()
+            .zip(sizes.iter())
+            .map(|(p, &sz)| {
+                let fname = p.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, sz, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &raw_items);
+        let arena = store.arena_base_ptr();
+        let mut files: Vec<FileItem> = raw_items;
+        for (i, file) in files.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+        }
+        std::mem::forget(store);
 
         let options = super::GrepSearchOptions {
             max_file_size: 10 * 1024 * 1024,
@@ -2361,6 +2374,7 @@ mod tests {
             None,
             None,
             dir.path(),
+            arena,
         );
 
         // Should find matches from file1 (GrepMode, GrepMatch) and file2 (PlainTextMatcher)
@@ -2402,6 +2416,7 @@ mod tests {
             None,
             None,
             dir.path(),
+            arena,
         );
         assert_eq!(
             result2.matches.len(),
@@ -2420,6 +2435,7 @@ mod tests {
             None,
             None,
             dir.path(),
+            arena,
         );
         assert_eq!(
             result3.matches.len(),

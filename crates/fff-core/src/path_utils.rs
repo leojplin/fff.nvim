@@ -45,9 +45,7 @@ pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &st
     };
 
     // Strip trailing separator from candidate_dir
-    let candidate_dir = candidate_dir
-        .strip_suffix('/')
-        .unwrap_or(candidate_dir);
+    let candidate_dir = candidate_dir.strip_suffix('/').unwrap_or(candidate_dir);
 
     if current_dir == candidate_dir {
         return 0;
@@ -101,16 +99,10 @@ mod tests {
     #[cfg(not(target_family = "windows"))]
     fn test_calculate_distance_penalty() {
         // candidate_dir is now just the directory portion (with or without trailing /)
-        assert_eq!(
-            calculate_distance_penalty(None, "examples/user/test/"),
-            0
-        );
+        assert_eq!(calculate_distance_penalty(None, "examples/user/test/"), 0);
         // Same directory
         assert_eq!(
-            calculate_distance_penalty(
-                Some("examples/user/test/main.rs"),
-                "examples/user/test/"
-            ),
+            calculate_distance_penalty(Some("examples/user/test/main.rs"), "examples/user/test/"),
             0
         );
         //

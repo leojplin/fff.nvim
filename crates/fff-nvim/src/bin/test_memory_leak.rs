@@ -139,12 +139,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_file_count = {
         let guard = shared_picker.read().unwrap();
         if let Some(ref picker) = *guard {
+            let arena = picker.arena_base_ptr();
             let files = picker.get_files();
             println!("Found {} files in picker", files.len());
             if !files.is_empty() {
                 println!("Sample files:");
                 for (i, file) in files.iter().take(5).enumerate() {
-                    println!("  {}. {}", i + 1, file.relative_path());
+                    println!("  {}. {}", i + 1, file.relative_path(arena));
                 }
             }
             files.len()
@@ -199,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (result_count, search_duration) = {
             let guard = shared_picker.read().unwrap();
             if let Some(ref picker) = *guard {
+                let arena = picker.arena_base_ptr();
                 let parsed = parser.parse(query);
                 let search_result = FilePicker::fuzzy_search(
                     picker.get_files(),
@@ -215,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             limit: max_results,
                         },
                     },
-                    None,
+                    arena,
                 );
                 let duration = search_start.elapsed();
                 (search_result.items.len(), duration)

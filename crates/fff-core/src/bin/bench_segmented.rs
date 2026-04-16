@@ -12,6 +12,7 @@ use fff_search::types::PaginationArgs;
 use fff_search::{FuzzySearchOptions, QueryParser};
 use std::time::Instant;
 
+#[allow(deprecated)]
 fn get_rss_mb() -> f64 {
     #[cfg(target_os = "macos")]
     {
@@ -69,6 +70,7 @@ fn main() {
 
     let files = picker.get_files();
     let dirs = picker.get_dirs();
+    let arena = picker.arena_base_ptr();
 
     // Struct size analysis
     let file_item_size = std::mem::size_of::<fff_search::types::FileItem>();
@@ -97,27 +99,23 @@ fn main() {
     let mut total_overlap_bytes = 0usize;
     let mut total_chunked_fname_bytes = 0usize;
     for f in files.iter() {
-        let dir_len = f.dir_str().len();
-        let fname_len = f.file_name().len();
+        let dir_len = f.dir_str(arena).len();
+        let fname_len = f.file_name(arena).len();
         let overlap = dir_len % 16; // bytes of dir in the bridge chunk
-        let chunked = ((overlap + fname_len + 15) / 16) * 16; // 16B-aligned
+        let chunked = (overlap + fname_len).div_ceil(16) * 16; // 16B-aligned
         total_overlap_bytes += overlap;
         total_chunked_fname_bytes += chunked;
     }
 
     // Arena size analysis
-    let total_dir_bytes: usize = files.iter().map(|f| f.dir_str().len()).sum();
-    let total_fname_bytes: usize = files.iter().map(|f| f.file_name().len()).sum();
+    let total_dir_bytes: usize = files.iter().map(|f| f.dir_str(arena).len()).sum();
+    let total_fname_bytes: usize = files.iter().map(|f| f.file_name(arena).len()).sum();
     let total_path_bytes: usize = total_dir_bytes + total_fname_bytes;
     let unique_dir_bytes: usize = dirs
         .iter()
         .map(|d| {
             let r = d.relative_path();
-            if r.is_empty() {
-                0
-            } else {
-                r.len() + 1
-            }
+            if r.is_empty() { 0 } else { r.len() + 1 }
         })
         .sum();
     let padded_dir_bytes: usize = dirs
@@ -125,7 +123,7 @@ fn main() {
         .map(|d| {
             let r = d.relative_path();
             let dir_len = if r.is_empty() { 0 } else { r.len() + 1 };
-            ((dir_len + 15) / 16) * 16
+            dir_len.div_ceil(16) * 16
         })
         .sum();
     let file_item_growth = files.len() * (file_item_size - 80);
@@ -141,7 +139,8 @@ fn main() {
         padded_dir_bytes as f64 / 1_048_576.0,
         (total_dir_bytes - unique_dir_bytes) as f64 / 1_048_576.0,
         file_item_growth as f64 / 1_048_576.0,
-        (total_dir_bytes as isize - padded_dir_bytes as isize - file_item_growth as isize) as f64 / 1_048_576.0,
+        (total_dir_bytes as isize - padded_dir_bytes as isize - file_item_growth as isize) as f64
+            / 1_048_576.0,
     );
     eprintln!(
         "Arenas: chunk={:.2}MB, fname={:.2}MB, total={:.2}MB (old flat would be {:.2}MB)",
@@ -150,7 +149,7 @@ fn main() {
         arena_total as f64 / 1_048_576.0,
         total_path_bytes as f64 / 1_048_576.0,
     );
-    let total_fname_raw: usize = files.iter().map(|f| f.file_name().len()).sum();
+    let total_fname_raw: usize = files.iter().map(|f| f.file_name(arena).len()).sum();
     eprintln!(
         "Chunked fname: {:.2}MB (overlap={:.2}MB, padding={:.2}MB) vs packed {:.2}MB → +{:.2}MB",
         total_chunked_fname_bytes as f64 / 1_048_576.0,
@@ -183,7 +182,7 @@ fn main() {
     // Warmup
     let parsed = parser.parse("warmup");
     for _ in 0..5 {
-        let _ = FilePicker::fuzzy_search(files, &parsed, None, make_opts(), None);
+        let _ = FilePicker::fuzzy_search(files, &parsed, None, make_opts(), arena);
     }
 
     let parsed = parser.parse(query);
@@ -196,7 +195,7 @@ fn main() {
 
     for _ in 0..iterations {
         let start = Instant::now();
-        let sr = FilePicker::fuzzy_search(files, &parsed, None, make_opts(), None);
+        let sr = FilePicker::fuzzy_search(files, &parsed, None, make_opts(), arena);
         total += start.elapsed();
         matches = sr.total_matched;
     }

@@ -4,7 +4,7 @@
 ///   cargo build --release --bin bench_grep_query
 ///   ./target/release/bench_grep_query --path ~/dev/chromium --query "MAX_FILE_SIZE" --iters 3
 ///   ./target/release/bench_grep_query --path ~/dev/chromium --query "TODO" --no-bigram
-use fff::grep::{grep_search, parse_grep_query, GrepMode, GrepSearchOptions};
+use fff::grep::{GrepMode, GrepSearchOptions, grep_search, parse_grep_query};
 use fff::types::ContentCacheBudget;
 use std::time::Instant;
 
@@ -24,6 +24,7 @@ fn run_grep(
     query: &str,
     iters: usize,
     base_path: &std::path::Path,
+    arena: *const u8,
 ) {
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
@@ -46,7 +47,7 @@ fn run_grep(
     for i in 0..iters {
         let t = Instant::now();
         let result = grep_search(
-            files, &parsed, &options, &budget, index, None, None, base_path,
+            files, &parsed, &options, &budget, index, None, None, base_path, arena,
         );
         let us = t.elapsed().as_micros();
         times_us.push(us);
@@ -79,9 +80,13 @@ fn run_grep(
     }
 }
 
-fn build_bigram(files: &mut [fff::FileItem], base_path: &std::path::Path) -> fff::BigramFilter {
+fn build_bigram(
+    files: &mut [fff::FileItem],
+    base_path: &std::path::Path,
+    arena: *const u8,
+) -> fff::BigramFilter {
     let budget = ContentCacheBudget::default();
-    let (index, binary_indices) = fff::build_bigram_index(files, &budget, base_path);
+    let (index, binary_indices) = fff::build_bigram_index(files, &budget, base_path, arena);
 
     for &i in &binary_indices {
         files[i].set_binary(true);
@@ -133,7 +138,7 @@ fn main() {
     // ── 1. Scan files ──────────────────────────────────────────────────
     eprint!("[1/3] Scanning files... ");
     let t = Instant::now();
-    let mut files = fff::scan_files(&canonical);
+    let (mut files, arena) = fff::scan_files(&canonical);
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     eprintln!(
         "{} files in {:.2}s ({} non-binary)",
@@ -148,14 +153,14 @@ fn main() {
             "\n[3/3] Running grep \"{}\" x {} iterations\n",
             query, iters
         );
-        run_grep(&files, None, query, iters, &repo);
+        run_grep(&files, None, query, iters, &repo, arena);
         return;
     }
 
     // ── 2. Build bigram index ──────────────────────────────────────────
     eprint!("[2/3] Bigram index... ");
     let t = Instant::now();
-    let index = build_bigram(&mut files, &repo);
+    let index = build_bigram(&mut files, &repo, arena);
     eprintln!(
         "done in {:.2}s  ({} cols, {:.1} MB)",
         t.elapsed().as_secs_f64(),
@@ -168,5 +173,5 @@ fn main() {
         "\n[3/3] Running grep \"{}\" x {} iterations\n",
         query, iters
     );
-    run_grep(&files, Some(&index), query, iters, &repo);
+    run_grep(&files, Some(&index), query, iters, &repo, arena);
 }

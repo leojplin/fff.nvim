@@ -4,7 +4,7 @@
 //! language with C FFI support. No JSON serialization is used for search or grep
 //! results — callers read struct fields directly.
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 
 use fff::git::format_git_status;
@@ -76,12 +76,12 @@ pub struct FffFileItem {
     pub is_binary: bool,
 }
 
-impl From<&FileItem> for FffFileItem {
-    fn from(item: &FileItem) -> Self {
+impl FffFileItem {
+    pub fn from_item(item: &FileItem, arena: *const u8) -> Self {
         FffFileItem {
-            path: cstring_new(&item.relative_path()),
-            relative_path: cstring_new(&item.relative_path()),
-            file_name: cstring_new(item.file_name()),
+            path: cstring_new(&item.relative_path(arena)),
+            relative_path: cstring_new(&item.relative_path(arena)),
+            file_name: cstring_new(&item.file_name(arena)),
             git_status: cstring_new(format_git_status(item.git_status)),
             size: item.size,
             modified: item.modified,
@@ -232,8 +232,12 @@ pub struct FffSearchResult {
 
 impl FffSearchResult {
     /// Convert a core `SearchResult` into a heap-allocated `FffSearchResult`.
-    pub fn from_core(result: &SearchResult) -> *mut Self {
-        let items: Vec<FffFileItem> = result.items.iter().map(|i| FffFileItem::from(*i)).collect();
+    pub fn from_core(result: &SearchResult, arena: *const u8) -> *mut Self {
+        let items: Vec<FffFileItem> = result
+            .items
+            .iter()
+            .map(|i| FffFileItem::from_item(i, arena))
+            .collect();
         let scores: Vec<FffScore> = result.scores.iter().map(FffScore::from).collect();
         let count = items.len() as u32;
 
@@ -299,7 +303,7 @@ pub struct FffGrepMatch {
 }
 
 impl FffGrepMatch {
-    fn from_core_with_file(m: &GrepMatch, file: &FileItem) -> Self {
+    fn from_core_with_file(m: &GrepMatch, file: &FileItem, arena: *const u8) -> Self {
         let ranges: Vec<FffMatchRange> = m
             .match_byte_offsets
             .iter()
@@ -314,9 +318,9 @@ impl FffGrepMatch {
         };
 
         FffGrepMatch {
-            path: cstring_new(&file.relative_path()),
-            relative_path: cstring_new(&file.relative_path()),
-            file_name: cstring_new(file.file_name()),
+            path: cstring_new(&file.relative_path(arena)),
+            relative_path: cstring_new(&file.relative_path(arena)),
+            file_name: cstring_new(&file.file_name(arena)),
             git_status: cstring_new(format_git_status(file.git_status)),
             line_content: cstring_new(&m.line_content),
             match_ranges,
@@ -397,13 +401,13 @@ pub struct FffGrepResult {
 
 impl FffGrepResult {
     /// Convert a core `GrepResult` into a heap-allocated `FffGrepResult`.
-    pub fn from_core(result: &GrepResult) -> *mut Self {
+    pub fn from_core(result: &GrepResult, arena: *const u8) -> *mut Self {
         let items: Vec<FffGrepMatch> = result
             .matches
             .iter()
             .map(|m| {
                 let file = result.files[m.file_index];
-                FffGrepMatch::from_core_with_file(m, file)
+                FffGrepMatch::from_core_with_file(m, file, arena)
             })
             .collect();
         let (items_ptr, count) = vec_to_raw(items);

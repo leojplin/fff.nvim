@@ -11,6 +11,7 @@ use fff_query_parser::{Constraint, GitStatusFilter};
 use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
+use crate::simd_path::PATH_BUF_SIZE;
 
 /// Case-insensitive ASCII substring search without allocation.
 /// `needle` must already be lowercase.
@@ -44,32 +45,20 @@ const PAR_THRESHOLD: usize = 10_000;
 
 /// Trait for items that can be filtered by constraints.
 /// Implement this for any searchable item type (files, grep results, etc.).
+///
+/// All path accessors write into caller-provided buffers to avoid allocation
+/// on hot paths. The buffers must be at least 512 bytes.
 pub trait Constrainable {
-    /// The directory portion of the relative path (e.g. "src/" or "" for root)
-    fn dir_path(&self) -> &str;
+    /// Write the file name component into `buf`.
+    /// Returns `&str` over the written bytes (e.g. "main.rs").
+    fn write_file_name<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str;
 
-    /// The file name component (e.g. "main.rs")
-    fn file_name(&self) -> &str;
-
-    /// The git status of this item, if available
+    /// The git status of this item, if available.
     fn git_status(&self) -> Option<git2::Status>;
 
     /// Write the full relative path (dir + filename) into `buf`.
     /// Returns `&str` over the written bytes.
-    fn write_relative_path<'a>(&self, buf: &'a mut [u8; 512]) -> &'a str {
-        let dir = self.dir_path().as_bytes();
-        let fname = self.file_name().as_bytes();
-        let total = dir.len() + fname.len();
-        buf[..dir.len()].copy_from_slice(dir);
-        buf[dir.len()..total].copy_from_slice(fname);
-
-        unsafe { std::str::from_utf8_unchecked(&buf[..total]) }
-    }
-
-    /// Reconstruct the full relative path. Allocates.
-    fn relative_path(&self) -> String {
-        format!("{}{}", self.dir_path(), self.file_name())
-    }
+    fn write_relative_path<'a>(&self, arena: *const u8, buf: &'a mut [u8]) -> &'a str;
 }
 
 /// Check if a relative path ends with the given suffix at a `/` boundary (case-insensitive).
@@ -154,33 +143,34 @@ fn item_matches_constraint_at_index<T: Constrainable>(
     glob_results: &[(bool, AHashSet<usize>)],
     glob_idx: &mut usize,
     negate: bool,
+    arena: *const u8,
 ) -> bool {
     let matches = match constraint {
-        Constraint::Extension(ext) => file_has_extension(item.file_name(), ext),
+        Constraint::Extension(ext) => {
+            let mut fname_buf = [0u8; 256];
+            let fname = item.write_file_name(arena, &mut fname_buf);
+            file_has_extension(fname, ext)
+        }
         Constraint::Glob(_) => {
             let result = glob_results
                 .get(*glob_idx)
                 .map(|(is_neg, set)| {
                     let matched = set.contains(&item_index);
 
-                    if *is_neg {
-                        !matched
-                    } else {
-                        matched
-                    }
+                    if *is_neg { !matched } else { matched }
                 })
                 .unwrap_or(true);
             *glob_idx += 1;
             return if negate { !result } else { result };
         }
         Constraint::PathSegment(segment) => {
-            let mut buf = [0u8; 512];
-            let path = item.write_relative_path(&mut buf);
+            let mut buf = [0u8; PATH_BUF_SIZE];
+            let path = item.write_relative_path(arena, &mut buf);
             path_contains_segment(path, segment)
         }
         Constraint::FilePath(suffix) => {
-            let mut buf = [0u8; 512];
-            let path = item.write_relative_path(&mut buf);
+            let mut buf = [0u8; PATH_BUF_SIZE];
+            let path = item.write_relative_path(arena, &mut buf);
             path_ends_with_suffix(path, suffix)
         }
         Constraint::GitStatus(status_filter) => match (item.git_status(), status_filter) {
@@ -205,13 +195,14 @@ fn item_matches_constraint_at_index<T: Constrainable>(
                 glob_results,
                 glob_idx,
                 !negate,
+                arena,
             );
         }
 
         // only works with negation
         Constraint::Text(text) => {
-            let mut buf = [0u8; 512];
-            let path = item.write_relative_path(&mut buf);
+            let mut buf = [0u8; PATH_BUF_SIZE];
+            let path = item.write_relative_path(arena, &mut buf);
             contains_ascii_ci(path, text)
         }
 
@@ -219,11 +210,7 @@ fn item_matches_constraint_at_index<T: Constrainable>(
         Constraint::Parts(_) | Constraint::Exclude(_) | Constraint::FileType(_) => true,
     };
 
-    if negate {
-        !matches
-    } else {
-        matches
-    }
+    if negate { !matches } else { matches }
 }
 
 /// Apply constraint-based prefiltering in a single pass over all items.
@@ -235,6 +222,7 @@ fn item_matches_constraint_at_index<T: Constrainable>(
 pub fn apply_constraints<'a, T: Constrainable + Sync>(
     items: &'a [T],
     constraints: &[Constraint<'_>],
+    arena: *const u8,
 ) -> Option<Vec<&'a T>> {
     if constraints.is_empty() {
         return None;
@@ -259,30 +247,32 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
     let glob_results = if has_globs {
         // Build a single contiguous buffer of all relative paths + offset table.
         // One allocation for the buffer, one for offsets — NOT one String per file.
-        let mut buf = Vec::<u8>::new();
+        let mut path_buf = Vec::<u8>::new();
         let mut offsets = Vec::<(usize, usize)>::with_capacity(items.len());
+        let mut tmp = [0u8; PATH_BUF_SIZE];
         for item in items.iter() {
-            let start = buf.len();
-            buf.extend_from_slice(item.dir_path().as_bytes());
-            buf.extend_from_slice(item.file_name().as_bytes());
-            offsets.push((start, buf.len() - start));
+            let start = path_buf.len();
+            let rel = item.write_relative_path(arena, &mut tmp);
+            path_buf.extend_from_slice(rel.as_bytes());
+            offsets.push((start, path_buf.len() - start));
         }
         let path_refs: Vec<&str> = offsets
             .iter()
-            .map(|&(off, len)| unsafe { std::str::from_utf8_unchecked(&buf[off..off + len]) })
+            .map(|&(off, len)| unsafe { std::str::from_utf8_unchecked(&path_buf[off..off + len]) })
             .collect();
         precompute_glob_matches(&other_constraints, &path_refs)
     } else {
         Vec::new()
     };
 
+    let arena_ptr = crate::simd_path::ArenaPtr::new(arena);
     let matches_constraints = |i: usize, item: &T| -> bool {
-        if !extensions.is_empty()
-            && !extensions
-                .iter()
-                .any(|ext| file_has_extension(item.file_name(), ext))
-        {
-            return false;
+        if !extensions.is_empty() {
+            let mut fname_buf = [0u8; 256];
+            let fname = item.write_file_name(arena_ptr.as_ptr(), &mut fname_buf);
+            if !extensions.iter().any(|ext| file_has_extension(fname, ext)) {
+                return false;
+            }
         }
 
         let mut glob_idx = 0;
@@ -294,6 +284,7 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
                 &glob_results,
                 &mut glob_idx,
                 false,
+                arena_ptr.as_ptr(),
             )
         })
     };

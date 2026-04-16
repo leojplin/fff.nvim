@@ -7,8 +7,8 @@ use fff::git::format_git_status;
 use fff::{FFFMode, FuzzySearchOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
 use std::env;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -59,7 +59,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get initial file count from shared state
     let initial_count = {
         let guard = shared_picker.read().unwrap();
-        let files = guard.as_ref().unwrap().get_files();
+        let picker = guard.as_ref().unwrap();
+        let arena = picker.arena_base_ptr();
+        let files = picker.get_files();
         println!("Initial file count: {}", files.len());
 
         if !files.is_empty() {
@@ -68,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  {}. {} ({})",
                     i + 1,
-                    file.relative_path(),
+                    file.relative_path(arena),
                     format_git_status(file.git_status)
                 );
             }
@@ -107,10 +109,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Show some recently added files
                 let guard = shared_picker.read().unwrap();
-                let files = guard.as_ref().unwrap().get_files();
+                let picker = guard.as_ref().unwrap();
+                let arena = picker.arena_base_ptr();
+                let files = picker.get_files();
                 let newest_files = files.iter().rev().take(added.min(3));
                 for file in newest_files {
-                    println!("   ➕ {}", file.relative_path());
+                    println!("   ➕ {}", file.relative_path(arena));
                 }
             } else {
                 let removed = last_count - current_count;
@@ -152,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let timestamp = chrono::Local::now().format("%H:%M:%S");
             let guard = shared_picker.read().unwrap();
             let picker_ref = guard.as_ref().unwrap();
+            let arena = picker_ref.arena_base_ptr();
             let files = picker_ref.get_files();
             let parser = QueryParser::default();
             let parsed = parser.parse("rs");
@@ -170,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         limit: 5,
                     },
                 },
-                None,
+                arena,
             );
 
             println!(
@@ -188,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "   {}. {} (score: {})",
                     i + 1,
-                    file.relative_path(),
+                    file.relative_path(arena),
                     score.total
                 );
             }

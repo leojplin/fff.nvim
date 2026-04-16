@@ -1,9 +1,8 @@
 use crate::{
-    bigram_query::fuzzy_to_bigram_query,
-    bigram_filter::BigramFilter,
     constraints::apply_constraints,
     git::is_modified_status,
     path_utils::calculate_distance_penalty,
+    simd_path::{ArenaPtr, PATH_BUF_SIZE},
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
     types::{FileItem, Score, ScoringContext},
 };
@@ -58,13 +57,28 @@ impl<'a> FileItems<'a> {
 /// Files are passed directly to frizbee via the `Matchable` trait —
 /// deleted files return `None` from `match_str()` and are skipped
 /// without any intermediate allocation.
+/// Resolve a FileItem's ChunkedString into chunk pointers for SIMD matching.
+/// Returns `Some((chunk_count, byte_len))` or `None` for deleted/empty files.
+#[inline]
+fn resolve_file_chunks(
+    file: &FileItem,
+    arena_base: *const u8,
+    ptrs_buf: &mut [*const u8; 32],
+) -> Option<(usize, u16)> {
+    if file.is_deleted() || file.path.is_empty() {
+        return None;
+    }
+    let resolved = file.path.resolve_ptrs(arena_base, ptrs_buf);
+    Some((resolved.len(), file.path.byte_len))
+}
+
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
     working_files: &FileItems<'_>,
     options: &neo_frizbee::Config,
     max_threads: usize,
-    _path_bigram_index: Option<&BigramFilter>,
+    arena_base: *const u8,
 ) -> Vec<neo_frizbee::Match> {
     // Filter out parts that are too short (< 2 chars)
     let valid_parts: Vec<&str> = fuzzy_parts
@@ -78,18 +92,38 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    let first_part_matches = match working_files {
-        FileItems::All(files) => {
-            neo_frizbee::match_list_parallel_segmented(valid_parts[0], files, options, max_threads)
-        }
-        FileItems::Filtered(files) => {
-            neo_frizbee::match_list_parallel_segmented(
-                valid_parts[0],
-                &files,
-                options,
-                max_threads,
-            )
-        }
+    // Match directly from FileItem.path ChunkedStrings via frizbee's
+    // resolver API — zero allocation. Each worker resolves chunk pointers
+    // on the stack and feeds them to the chunked SIMD scorer.
+    let file_slice: &[FileItem] = match working_files {
+        FileItems::All(s) => s,
+        FileItems::Filtered(_) => &[], // handled below
+    };
+
+    let arena = ArenaPtr::new(arena_base);
+    let first_part_matches = if !file_slice.is_empty() {
+        neo_frizbee::match_list_parallel_resolved(
+            valid_parts[0],
+            file_slice,
+            &|file: &FileItem, ptrs_buf: &mut [*const u8; 32]| {
+                resolve_file_chunks(file, arena.as_ptr(), ptrs_buf)
+            },
+            options,
+            max_threads,
+        )
+    } else if let FileItems::Filtered(refs) = working_files {
+        // For filtered files, resolve through the references
+        neo_frizbee::match_list_parallel_resolved(
+            valid_parts[0],
+            refs.as_slice(),
+            &|file_ref: &&FileItem, ptrs_buf: &mut [*const u8; 32]| {
+                resolve_file_chunks(file_ref, arena.as_ptr(), ptrs_buf)
+            },
+            options,
+            max_threads,
+        )
+    } else {
+        vec![]
     };
 
     if valid_parts.len() == 1 {
@@ -106,10 +140,9 @@ fn match_fuzzy_parts(
             .into_iter()
             .filter_map(|mut m| {
                 let file = working_files.index(m.index as usize);
-                let mut buf = [0u8; 512];
-                let path = file.write_relative_path(&mut buf);
-                let part_matches =
-                    neo_frizbee::match_list(part, &[path], &part_options);
+                let mut buf = [0u8; PATH_BUF_SIZE];
+                let path = file.write_relative_path(arena_base, &mut buf);
+                let part_matches = neo_frizbee::match_list(part, &[path], &part_options);
                 let part_match = part_matches.first()?;
 
                 // Sum scores
@@ -130,6 +163,7 @@ fn match_fuzzy_parts(
 pub fn match_and_score_files<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
+    arena_base: *const u8,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     if files.is_empty() {
         return (vec![], vec![], 0);
@@ -139,7 +173,7 @@ pub fn match_and_score_files<'a>(
     let working_files: FileItems<'a> = if parsed.constraints.is_empty() {
         FileItems::All(files)
     } else {
-        match apply_constraints(files, &parsed.constraints) {
+        match apply_constraints(files, &parsed.constraints, arena_base) {
             Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
             Some(_) => {
                 return (vec![], vec![], 0);
@@ -152,7 +186,7 @@ pub fn match_and_score_files<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_filtered_by_frecency(&working_files, context);
+            return score_filtered_by_frecency(&working_files, context, arena_base);
         }
     };
     debug_assert!(!fuzzy_parts.is_empty());
@@ -179,7 +213,7 @@ pub fn match_and_score_files<'a>(
         &working_files,
         &options,
         context.max_threads,
-        context.path_bigram_index,
+        arena_base,
     );
 
     let t1 = std::time::Instant::now();
@@ -195,7 +229,7 @@ pub fn match_and_score_files<'a>(
     {
         vec![]
     } else {
-        let mut fallback_filenames: Vec<&str> = Vec::new();
+        let mut fallback_filenames: Vec<String> = Vec::new();
 
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
@@ -204,16 +238,18 @@ pub fn match_and_score_files<'a>(
 
             if match_start_approx < filename_start {
                 fallback_indices.push(i as u32);
-                fallback_filenames.push(file.file_name());
+                let mut fbuf = [0u8; 256];
+                fallback_filenames.push(file.path.file_name(arena_base, &mut fbuf).to_string());
             }
         }
 
         if fallback_filenames.is_empty() {
             vec![]
         } else {
+            let fallback_refs: Vec<&str> = fallback_filenames.iter().map(String::as_str).collect();
             let mut matches = neo_frizbee::match_list_parallel(
                 fuzzy_parts[0],
-                &fallback_filenames,
+                &fallback_refs,
                 &options,
                 if path_matches.len() > 10_000 {
                     context.max_threads
@@ -247,8 +283,9 @@ pub fn match_and_score_files<'a>(
                 0
             };
 
-            let distance_penalty =
-                calculate_distance_penalty(context.current_file, file.dir_str());
+            let mut dir_buf = [0u8; PATH_BUF_SIZE];
+            let dir = file.path.dir_str(arena_base, &mut dir_buf);
+            let distance_penalty = calculate_distance_penalty(context.current_file, dir);
 
             let filename_start = file.filename_offset_in_relative() as u16;
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
@@ -269,11 +306,13 @@ pub fn match_and_score_files<'a>(
                 None
             };
 
+            let mut fname_buf = [0u8; 256];
+            let fname = file.path.file_name(arena_base, &mut fname_buf);
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
             let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
                 || (end_col_filename_match
-                    && main_needle_len as usize == file.file_name().len()
-                    && main_needle.eq_ignore_ascii_case(file.file_name().as_bytes()));
+                    && main_needle_len as usize == fname.len()
+                    && main_needle.eq_ignore_ascii_case(fname.as_bytes()));
 
             let mut has_special_filename_bonus = false;
             let filename_bonus = if is_exact_filename {
@@ -287,7 +326,7 @@ pub fn match_and_score_files<'a>(
                 } else {
                     max_bonus
                 }
-            } else if !is_filename_match && is_special_entry_point_file(file.file_name()) {
+            } else if !is_filename_match && is_special_entry_point_file(fname) {
                 has_special_filename_bonus = true;
                 base_score * 5 / 100
             } else {
@@ -295,22 +334,14 @@ pub fn match_and_score_files<'a>(
             };
 
             let current_file_penalty =
-                calculate_current_file_penalty(file, base_score / 4, context);
+                calculate_current_file_penalty(file, base_score / 4, context, arena_base);
             let combo_match_boost = {
-                let last_same_query_match = context
-                    .last_same_query_match
-                    .as_ref()
-                    .filter(|m| {
-                        let file_path_str = m.file_path.to_string_lossy();
-                        // Check ends_with(dir + filename) without reconstruction:
-                        // file_path must end with filename, and the part before
-                        // that must end with dir_str.
-                        let fname = file.file_name();
-                        let dir = file.dir_str();
-                        file_path_str.len() >= dir.len() + fname.len()
-                            && file_path_str.ends_with(fname)
-                            && file_path_str[..file_path_str.len() - fname.len()].ends_with(dir)
-                    });
+                let last_same_query_match = context.last_same_query_match.as_ref().filter(|m| {
+                    let file_path_str = m.file_path.to_string_lossy();
+                    file_path_str.len() >= dir.len() + fname.len()
+                        && file_path_str.ends_with(fname)
+                        && file_path_str[..file_path_str.len() - fname.len()].ends_with(dir)
+                });
 
                 match last_same_query_match {
                     Some(_) if context.min_combo_count == 0 => 1000,
@@ -440,7 +471,9 @@ fn is_special_entry_point_file(filename: &str) -> bool {
 pub(crate) fn score_filtered_by_frecency<'a>(
     files: &FileItems<'a>,
     context: &ScoringContext,
+    arena_base: *const u8,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    let arena = ArenaPtr::new(arena_base);
     let score_file = |file: &'a FileItem| {
         let total_frecency_score = file.access_frecency_score as i32
             + (file.modification_frecency_score as i32).saturating_mul(4);
@@ -453,7 +486,7 @@ pub(crate) fn score_filtered_by_frecency<'a>(
         };
 
         let current_file_penalty =
-            calculate_current_file_penalty(file, total_frecency_score, context);
+            calculate_current_file_penalty(file, total_frecency_score, context, arena.as_ptr());
         let total = total_frecency_score
             .saturating_add(git_status_boost)
             .saturating_add(current_file_penalty);
@@ -497,11 +530,12 @@ fn calculate_current_file_penalty(
     file: &FileItem,
     base_score: i32,
     context: &ScoringContext,
+    arena_base: *const u8,
 ) -> i32 {
     let mut penalty = 0i32;
 
     if let Some(current) = context.current_file
-        && file.relative_path_eq(current)
+        && file.relative_path_eq(arena_base, current)
     {
         penalty -= base_score;
     }
@@ -585,16 +619,7 @@ mod tests {
     // ── Helpers ──────────────────────────────────────────────────────────
 
     fn create_test_file(path: &str, score: i32, modified: u64) -> (FileItem, Score) {
-        let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-        let file = FileItem::new_raw(
-            path,
-            0,
-            filename_start,
-            0,
-            modified,
-            None,
-            false,
-        );
+        let file = FileItem::new_for_test(path, 0, modified, None, false);
         let score_obj = Score {
             total: score,
             base_score: score,
@@ -615,18 +640,18 @@ mod tests {
     #[test]
     fn test_partial_sort_descending() {
         // Create test data with known scores
-        let test_data = vec![
-            create_test_file("file1.rs", 100, 1000),
-            create_test_file("file2.rs", 200, 2000),
-            create_test_file("file3.rs", 50, 3000),
-            create_test_file("file4.rs", 300, 4000),
-            create_test_file("file5.rs", 150, 5000),
-            create_test_file("file6.rs", 250, 6000),
-            create_test_file("file7.rs", 80, 7000),
-            create_test_file("file8.rs", 180, 8000),
-            create_test_file("file9.rs", 120, 9000),
-            create_test_file("file10.rs", 90, 10000),
-        ];
+        let (test_data, arena) = build_test_files(&[
+            ("file1.rs", 100, 1000),
+            ("file2.rs", 200, 2000),
+            ("file3.rs", 50, 3000),
+            ("file4.rs", 300, 4000),
+            ("file5.rs", 150, 5000),
+            ("file6.rs", 250, 6000),
+            ("file7.rs", 80, 7000),
+            ("file8.rs", 180, 8000),
+            ("file9.rs", 120, 9000),
+            ("file10.rs", 90, 10000),
+        ]);
 
         // Convert to references like the actual function uses
         let results: Vec<(&FileItem, Score)> = test_data
@@ -646,7 +671,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram_index: None,
 
             pagination: PaginationArgs {
                 offset: 0,
@@ -665,21 +689,21 @@ mod tests {
         assert_eq!(scores[2].total, 200, "Third should be third highest");
 
         // Verify the files match
-        assert_eq!(items[0].relative_path(), "file4.rs");
-        assert_eq!(items[1].relative_path(), "file6.rs");
-        assert_eq!(items[2].relative_path(), "file2.rs");
+        assert_eq!(items[0].relative_path(arena), "file4.rs");
+        assert_eq!(items[1].relative_path(arena), "file6.rs");
+        assert_eq!(items[2].relative_path(arena), "file2.rs");
     }
 
     #[test]
     fn test_partial_sort_with_same_scores() {
         // Test tiebreaker with modified time
-        let test_data = [
-            create_test_file("file1.rs", 100, 5000), // Same score, older
-            create_test_file("file2.rs", 100, 8000), // Same score, newer
-            create_test_file("file3.rs", 100, 3000), // Same score, oldest
-            create_test_file("file4.rs", 200, 1000),
-            create_test_file("file5.rs", 200, 9000), // Higher score, newest
-        ];
+        let (test_data, _arena) = build_test_files(&[
+            ("file1.rs", 100, 5000), // Same score, older
+            ("file2.rs", 100, 8000), // Same score, newer
+            ("file3.rs", 100, 3000), // Same score, oldest
+            ("file4.rs", 200, 1000),
+            ("file5.rs", 200, 9000), // Higher score, newest
+        ]);
 
         let results: Vec<(&FileItem, Score)> = test_data
             .iter()
@@ -698,7 +722,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram_index: None,
 
             pagination: PaginationArgs {
                 offset: 0,
@@ -725,11 +748,11 @@ mod tests {
     #[test]
     fn test_no_partial_sort_for_small_results() {
         // When results.len() <= threshold, should use regular sort
-        let test_data = [
-            create_test_file("file1.rs", 100, 1000),
-            create_test_file("file2.rs", 200, 2000),
-            create_test_file("file3.rs", 50, 3000),
-        ];
+        let (test_data, arena) = build_test_files(&[
+            ("file1.rs", 100, 1000),
+            ("file2.rs", 200, 2000),
+            ("file3.rs", 50, 3000),
+        ]);
 
         let results: Vec<(&FileItem, Score)> = test_data
             .iter()
@@ -748,7 +771,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram_index: None,
 
             pagination: PaginationArgs {
                 offset: 0,
@@ -763,9 +785,9 @@ mod tests {
         assert_eq!(scores[0].total, 200);
         assert_eq!(scores[1].total, 100);
         assert_eq!(scores[2].total, 50);
-        assert_eq!(items[0].relative_path(), "file2.rs");
-        assert_eq!(items[1].relative_path(), "file1.rs");
-        assert_eq!(items[2].relative_path(), "file3.rs");
+        assert_eq!(items[0].relative_path(arena), "file2.rs");
+        assert_eq!(items[1].relative_path(arena), "file1.rs");
+        assert_eq!(items[2].relative_path(arena), "file3.rs");
     }
 }
 
@@ -807,17 +829,17 @@ mod filename_bonus_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram_index: None,
+
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
             },
         };
-        let (items, scores, _) = match_and_score_files(files, &ctx);
+        let (items, scores, _) = match_and_score_files(files, &ctx, arena);
         items
             .iter()
             .zip(scores.iter())
-            .map(|(f, s)| (f.relative_path().to_string(), s.clone()))
+            .map(|(f, s)| (f.relative_path(arena).to_string(), s.clone()))
             .collect()
     }
 
@@ -965,12 +987,9 @@ mod filename_bonus_tests {
 
     #[test]
     fn test_filename_match_ranks_above_path_only_match() {
-        let files = vec![
-            make_file("src/username/handler.rs"),
-            make_file("src/username/username.rs"),
-        ];
+        let (files, arena) = make_files(&["src/username/handler.rs", "src/username/username.rs"]);
 
-        let results = search(&files, "usrnmea");
+        let results = search(&files, "usrnmea", arena);
 
         assert!(
             results.len() >= 2,
@@ -998,7 +1017,7 @@ mod filename_bonus_tests {
             make_file("src/username.rs"),
         ];
 
-        let results = search(&files, "username.rs");
+        let results = search(&files, "username.rs", arena);
 
         assert!(results.len() >= 2);
         assert_eq!(
@@ -1016,7 +1035,7 @@ mod filename_bonus_tests {
             make_file("src/models/item.rs"),
         ];
 
-        let results = search(&files, "item.rs");
+        let results = search(&files, "item.rs", arena);
 
         assert!(results.len() >= 2);
         assert_eq!(results[0].0, "src/models/item.rs");
@@ -1029,9 +1048,9 @@ mod filename_bonus_tests {
 
     #[test]
     fn test_path_separator_disables_filename_bonus() {
-        let files = vec![make_file("src/controllers/user.rs")];
+        let (files, arena) = make_files(&["src/controllers/user.rs"]);
 
-        let results = search(&files, "src/user");
+        let results = search(&files, "src/user", arena);
 
         assert!(!results.is_empty());
         assert_eq!(

@@ -85,3 +85,7 @@ harness = false
 [[bin]]
 name = "bench_segmented"
 path = "src/bin/bench_segmented.rs"
+
+[[bin]]
+name = "bench_chunked"
+path = "src/bin/bench_chunked.rs"

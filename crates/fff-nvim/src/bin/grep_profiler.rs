@@ -10,18 +10,19 @@
 ///   cargo build --release --bin grep_profiler
 ///   ./target/release/grep_profiler [--path /path/to/repo]
 use fff::{
-    grep::{grep_search, parse_grep_query, GrepMode, GrepSearchOptions},
-    types::ContentCacheBudget,
     BigramFilter, FileItem,
+    grep::{GrepMode, GrepSearchOptions, grep_search, parse_grep_query},
+    types::ContentCacheBudget,
 };
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-fn load_files(base_path: &Path) -> Vec<FileItem> {
+fn load_files(base_path: &Path) -> (Vec<FileItem>, *const u8) {
     use ignore::WalkBuilder;
 
     let mut files = Vec::new();
+    let mut rel_paths = Vec::new();
 
     WalkBuilder::new(base_path)
         .hidden(false)
@@ -40,24 +41,20 @@ fn load_files(base_path: &Path) -> Vec<FileItem> {
             let size = entry.metadata().ok().map_or(0, |m| m.len());
             let is_binary = detect_binary(&path, size);
 
-            let path_string = path.to_string_lossy().into_owned();
-            let relative_start = (path_string.len() - relative_path.len()) as u16;
-            let filename_start = path_string
-                .rfind('/')
-                .map(|i| i + 1)
-                .unwrap_or(relative_start as usize) as u16;
-            files.push(FileItem::new_raw(
-                &path_string,
-                relative_start,
-                filename_start,
-                size,
-                0,
-                None,
-                is_binary,
-            ));
+            let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+            files.push(FileItem::new_raw(filename_start, size, 0, None, is_binary));
+            rel_paths.push(relative_path);
         });
 
-    files
+    let (store, strings) =
+        fff::simd_path::build_chunked_path_store_from_strings(&rel_paths, &files);
+    let arena = store.arena_base_ptr();
+    for (i, file) in files.iter_mut().enumerate() {
+        file.set_path(strings[i].clone());
+    }
+    std::mem::forget(store);
+
+    (files, arena)
 }
 
 fn detect_binary(path: &Path, size: u64) -> bool {
@@ -125,18 +122,25 @@ struct GrepBench<'a> {
     options: GrepSearchOptions,
     bigram_index: Option<&'a BigramFilter>,
     base_path: &'a std::path::Path,
+    arena: *const u8,
 }
 
 impl<'a> GrepBench<'a> {
-    fn new(files: &'a [FileItem], base_path: &'a std::path::Path) -> Self {
-        Self::with_mode(files, GrepMode::PlainText, base_path)
+    fn new(files: &'a [FileItem], base_path: &'a std::path::Path, arena: *const u8) -> Self {
+        Self::with_mode(files, GrepMode::PlainText, base_path, arena)
     }
 
-    fn with_mode(files: &'a [FileItem], mode: GrepMode, base_path: &'a std::path::Path) -> Self {
+    fn with_mode(
+        files: &'a [FileItem],
+        mode: GrepMode,
+        base_path: &'a std::path::Path,
+        arena: *const u8,
+    ) -> Self {
         Self {
             files,
             bigram_index: None,
             base_path,
+            arena,
             options: GrepSearchOptions {
                 max_file_size: 10 * 1024 * 1024,
                 max_matches_per_file: 200,
@@ -171,6 +175,7 @@ impl<'a> GrepBench<'a> {
             None,
             None,
             self.base_path,
+            self.arena,
         );
         let elapsed = start.elapsed();
         (elapsed, result.matches.len(), result.total_files_searched)
@@ -193,9 +198,9 @@ impl<'a> GrepBench<'a> {
     }
 }
 
-fn build_bigram(files: &mut [FileItem], base_path: &Path) -> BigramFilter {
+fn build_bigram(files: &mut [FileItem], base_path: &Path, arena: *const u8) -> BigramFilter {
     let budget = ContentCacheBudget::default();
-    let (index, binary_indices) = fff::build_bigram_index(files, &budget, base_path);
+    let (index, binary_indices) = fff::build_bigram_index(files, &budget, base_path, arena);
 
     for &i in &binary_indices {
         files[i].set_binary(true);
@@ -267,7 +272,7 @@ fn main() {
     // Direct file loading (no background thread)
     eprintln!("\n[1/7] Loading files...");
     let load_start = Instant::now();
-    let mut files = load_files(&canonical);
+    let (mut files, arena) = load_files(&canonical);
     let load_time = load_start.elapsed();
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     let large_files = files.iter().filter(|f| f.size > 10 * 1024 * 1024).count();
@@ -279,7 +284,7 @@ fn main() {
         large_files,
     );
 
-    let bench = GrepBench::new(&files, &canonical);
+    let bench = GrepBench::new(&files, &canonical, arena);
 
     eprintln!("[2/7] Cold cache benchmarks (first search, mmap not yet loaded)");
     eprintln!("  Each query runs once with fresh FileItem mmaps.\n");
@@ -298,8 +303,8 @@ fn main() {
 
     for (name, query) in &cold_queries {
         // Re-load files to get fresh FileItems with no cached mmaps
-        let fresh_files = load_files(&canonical);
-        let fresh_bench = GrepBench::new(&fresh_files, &canonical);
+        let (fresh_files, fresh_arena) = load_files(&canonical);
+        let fresh_bench = GrepBench::new(&fresh_files, &canonical, fresh_arena);
         let (stats, matches, files_searched) = fresh_bench.bench_query(query, 1);
         print_row(name, &stats, matches, files_searched, 1);
     }
@@ -340,7 +345,7 @@ fn main() {
 
     eprintln!("\n[3b/7] Building bigram index...");
     let bigram_start = Instant::now();
-    let bigram_index = build_bigram(&mut files, &canonical);
+    let bigram_index = build_bigram(&mut files, &canonical, arena);
     eprintln!(
         "  Built in {:.2}s ({} columns, {:.1} MB)\n",
         bigram_start.elapsed().as_secs_f64(),
@@ -351,7 +356,7 @@ fn main() {
     eprintln!("[3c/7] Bigram-accelerated warm benchmarks (same queries, with bigram prefilter)");
     print_header();
 
-    let bigram_bench = GrepBench::new(&files, &canonical).with_bigram(&bigram_index);
+    let bigram_bench = GrepBench::new(&files, &canonical, arena).with_bigram(&bigram_index);
     for (name, query, iters) in &warm_queries {
         let bigram_name = format!("bg_{}", name.strip_prefix("warm_").unwrap_or(name));
         let (stats, matches, files_searched) = bigram_bench.bench_query(query, *iters);
@@ -363,7 +368,7 @@ fn main() {
     eprintln!("  Running 3 warmup iterations, then measuring.\n");
     print_header();
 
-    let fuzzy_bench = GrepBench::with_mode(&files, GrepMode::Fuzzy, &canonical);
+    let fuzzy_bench = GrepBench::with_mode(&files, GrepMode::Fuzzy, &canonical, arena);
 
     let fuzzy_queries: Vec<(&str, &str, usize)> = vec![
         ("fuzzy_exact", "mutex_lock", 15),
@@ -395,7 +400,7 @@ fn main() {
     print_header();
 
     let fuzzy_bigram_bench =
-        GrepBench::with_mode(&files, GrepMode::Fuzzy, &canonical).with_bigram(&bigram_index);
+        GrepBench::with_mode(&files, GrepMode::Fuzzy, &canonical, arena).with_bigram(&bigram_index);
 
     for (name, query, iters) in &fuzzy_queries {
         let bg_name = format!("bg_{}", name);
@@ -451,7 +456,7 @@ fn main() {
     eprintln!("[6/7] Incremental typing simulation (plain text)");
     eprintln!("  Simulates user typing character by character.\n");
 
-    let bench = GrepBench::new(&files, &canonical);
+    let bench = GrepBench::new(&files, &canonical, arena);
     let typing_sequences: Vec<(&str, Vec<&str>)> = vec![
         (
             "mutex_lock",
@@ -534,7 +539,9 @@ fn main() {
             None,
             None,
             &canonical,
+            arena,
         );
+
         let elapsed = start.elapsed();
         eprintln!(
             "    {:>6} | {:>12} | {:>8} | {:>6} | {:>12}",

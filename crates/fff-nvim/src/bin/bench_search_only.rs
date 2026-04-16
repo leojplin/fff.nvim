@@ -23,6 +23,7 @@ fn main() {
     let files = {
         use ignore::WalkBuilder;
         let mut files = Vec::new();
+        let mut rel_paths = Vec::new();
 
         WalkBuilder::new(&canonical_path)
             .hidden(false)
@@ -33,29 +34,29 @@ fn main() {
                 let path = entry.path().to_path_buf();
                 let relative =
                     pathdiff::diff_paths(&path, &canonical_path).unwrap_or_else(|| path.clone());
-
                 let relative_path = relative.to_string_lossy().into_owned();
-
-                let path_string = path.to_string_lossy().into_owned();
-                let relative_start = (path_string.len() - relative_path.len()) as u16;
-                let filename_start = path_string
-                    .rfind('/')
-                    .map(|i| i + 1)
-                    .unwrap_or(relative_start as usize) as u16;
+                let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
                 files.push(FileItem::new_raw(
-                    &path_string,
-                    relative_start,
                     filename_start,
                     entry.metadata().ok().map_or(0, |m| m.len()),
                     0,
                     None,
                     false,
                 ));
+                rel_paths.push(relative_path);
             });
 
-        files
+        let (store, strings) =
+            fff::simd_path::build_chunked_path_store_from_strings(&rel_paths, &files);
+        let arena_base = store.arena_base_ptr();
+        for (i, file) in files.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+        }
+        std::mem::forget(store);
+        (files, arena_base)
     };
 
+    let (files, arena) = files;
     eprintln!(
         "✓ Loaded {} files in {:.2}s\n",
         files.len(),
@@ -104,7 +105,7 @@ fn main() {
                         limit: 100,
                     },
                 },
-                None,
+                arena,
             );
             match_count += results.total_matched;
         }

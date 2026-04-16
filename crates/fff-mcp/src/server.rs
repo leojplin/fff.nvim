@@ -249,6 +249,7 @@ impl FffServer {
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let arena = picker.arena_base_ptr();
 
         let parser = QueryParser::new(AiGrepConfig);
         let parsed = parser.parse(query);
@@ -289,6 +290,7 @@ impl FffServer {
                             max_results,
                             show_context: ctx_lines > 0,
                             auto_expand_defs: auto_expand,
+                            arena,
                         }
                         .format(&mut cs);
                         return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -314,8 +316,8 @@ impl FffServer {
                 let mut current_file = String::new();
                 for m in fuzzy_result.matches.iter().take(3) {
                     let file = fuzzy_result.files[m.file_index];
-                    if file.relative_path() != current_file {
-                        current_file = file.relative_path().to_string();
+                    if file.relative_path(arena) != current_file {
+                        current_file = file.relative_path(arena).to_string();
                         lines.push(current_file.to_string());
                     }
                     lines.push(format!(" {}: {}", m.line_number, m.line_content));
@@ -345,7 +347,7 @@ impl FffServer {
                     &file_query,
                     None,
                     file_opts,
-                    picker.path_bigram_index(),
+                    arena,
                 );
                 if let (Some(top), Some(score)) =
                     (file_result.items.first(), file_result.scores.first())
@@ -355,7 +357,7 @@ impl FffServer {
                     if score.base_score > query_len * 10 {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "0 content matches. But there is a relevant file path: {}",
-                            top.relative_path()
+                            top.relative_path(arena)
                         ))]));
                     }
                 }
@@ -383,6 +385,7 @@ impl FffServer {
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            arena,
         }
         .format(&mut cs);
 
@@ -420,6 +423,7 @@ impl FffServer {
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let arena = picker.arena_base_ptr();
 
         let files = picker.get_files();
         let base_path = picker.base_path();
@@ -438,7 +442,7 @@ impl FffServer {
         let parser = QueryParser::default();
         let fff_query = parser.parse(query);
         let result =
-            FilePicker::fuzzy_search(files, &fff_query, None, make_opts(page_offset), picker.path_bigram_index());
+            FilePicker::fuzzy_search(files, &fff_query, None, make_opts(page_offset), arena);
         let total_files = result.total_files;
 
         // Auto-retry with fewer terms if 3+ words return 0 results
@@ -454,7 +458,7 @@ impl FffServer {
                         &shorter_query,
                         /*query_tracker=*/ None,
                         make_opts(0),
-                        picker.path_bigram_index(),
+                        arena,
                     );
 
                     (retry.items, retry.scores, retry.total_matched)
@@ -480,12 +484,12 @@ impl FffServer {
             if is_exact_match {
                 lines.push(format!(
                     "→ Read {} (exact match!)",
-                    top_item.relative_path()
+                    top_item.relative_path(arena)
                 ));
             } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
                 lines.push(format!(
                     "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path()
+                    top_item.relative_path(arena)
                 ));
             }
         }
@@ -500,7 +504,7 @@ impl FffServer {
         for item in &items {
             lines.push(format!(
                 "{}{}",
-                item.relative_path(),
+                item.relative_path(arena),
                 file_suffix(item.git_status, item.total_frecency_score())
             ));
         }
@@ -589,6 +593,7 @@ impl FffServer {
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
+        let arena = picker.arena_base_ptr();
 
         let patterns_refs: Vec<&str> = params.patterns.iter().map(|s| s.as_str()).collect();
 
@@ -609,6 +614,7 @@ impl FffServer {
             overlay_guard.as_deref(),
             None,
             picker.base_path(),
+            arena,
         );
         let file_refs: Vec<&FileItem> = result.files.to_vec();
 
@@ -631,8 +637,17 @@ impl FffServer {
                 };
 
                 let parsed = parser.parse(&full_query);
-                let fb_result =
-                    grep::grep_search(files, &parsed, &fallback_options, budget, None, None, None, picker.base_path());
+                let fb_result = grep::grep_search(
+                    files,
+                    &parsed,
+                    &fallback_options,
+                    budget,
+                    None,
+                    None,
+                    None,
+                    picker.base_path(),
+                    arena,
+                );
 
                 if !fb_result.matches.is_empty() {
                     let fb_file_refs: Vec<&FileItem> = fb_result.files.to_vec();
@@ -647,6 +662,7 @@ impl FffServer {
                         max_results,
                         show_context: false,
                         auto_expand_defs: auto_expand,
+                        arena,
                     }
                     .format(&mut cs);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -678,6 +694,7 @@ impl FffServer {
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            arena,
         }
         .format(&mut cs);
 

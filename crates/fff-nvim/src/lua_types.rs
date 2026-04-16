@@ -4,21 +4,23 @@ use mlua::prelude::*;
 
 pub struct SearchResultLua<'a> {
     inner: SearchResult<'a>,
+    arena: *const u8,
 }
 
-impl<'a> From<SearchResult<'a>> for SearchResultLua<'a> {
-    fn from(inner: SearchResult<'a>) -> Self {
-        Self { inner }
+impl<'a> SearchResultLua<'a> {
+    pub fn new(inner: SearchResult<'a>, arena: *const u8) -> Self {
+        Self { inner, arena }
     }
 }
 
 pub struct GrepResultLua<'a> {
     inner: GrepResult<'a>,
+    arena: *const u8,
 }
 
-impl<'a> From<GrepResult<'a>> for GrepResultLua<'a> {
-    fn from(inner: GrepResult<'a>) -> Self {
-        Self { inner }
+impl<'a> GrepResultLua<'a> {
+    pub fn new(inner: GrepResult<'a>, arena: *const u8) -> Self {
+        Self { inner, arena }
     }
 }
 
@@ -27,17 +29,17 @@ struct LuaPosition((i32, i32));
 impl IntoLua for LuaPosition {
     fn into_lua(self, lua: &Lua) -> LuaResult<LuaValue> {
         let table = lua.create_table()?;
-        table.set("line", self.0 .0)?;
-        table.set("col", self.0 .1)?;
+        table.set("line", self.0.0)?;
+        table.set("col", self.0.1)?;
         Ok(LuaValue::Table(table))
     }
 }
 
-fn file_item_into_lua(item: &FileItem, lua: &Lua) -> LuaResult<LuaValue> {
+fn file_item_into_lua(item: &FileItem, lua: &Lua, arena: *const u8) -> LuaResult<LuaValue> {
     let table = lua.create_table()?;
-    table.set("path", item.relative_path())?;
-    table.set("relative_path", item.relative_path())?;
-    table.set("name", item.file_name())?;
+    table.set("path", item.relative_path(arena))?;
+    table.set("relative_path", item.relative_path(arena))?;
+    table.set("name", item.file_name(arena))?;
     table.set("size", item.size)?;
     table.set("modified", item.modified)?;
     table.set("access_frecency_score", item.access_frecency_score)?;
@@ -74,7 +76,7 @@ impl IntoLua for SearchResultLua<'_> {
         // Convert items
         let items_table = lua.create_table()?;
         for (i, item) in self.inner.items.iter().enumerate() {
-            items_table.set(i + 1, file_item_into_lua(item, lua)?)?;
+            items_table.set(i + 1, file_item_into_lua(item, lua, self.arena)?)?;
         }
         table.set("items", items_table)?;
 
@@ -123,9 +125,9 @@ impl IntoLua for GrepResultLua<'_> {
 
             // File metadata from the deduplicated files vec
             let file = self.inner.files[m.file_index];
-            item.set("path", file.relative_path())?;
-            item.set("relative_path", file.relative_path())?;
-            item.set("name", file.file_name())?;
+            item.set("path", file.relative_path(self.arena))?;
+            item.set("relative_path", file.relative_path(self.arena))?;
+            item.set("name", file.file_name(self.arena))?;
             item.set("is_binary", file.is_binary())?;
             item.set("git_status", format_git_status(file.git_status))?;
             item.set("size", file.size)?;

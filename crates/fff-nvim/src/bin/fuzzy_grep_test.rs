@@ -1,3 +1,4 @@
+use fff::FileItem;
 /// Fuzzy grep quality test against ~/dev/lightsource
 ///
 /// Runs queries through the fuzzy grep pipeline and prints results
@@ -6,16 +7,16 @@
 /// Usage:
 ///   cargo run --release --bin fuzzy_grep_test              # runs default test queries
 ///   cargo run --release --bin fuzzy_grep_test -- "query"   # runs a single user query
-use fff::grep::{grep_search, parse_grep_query, GrepMode, GrepSearchOptions};
-use fff::FileItem;
+use fff::grep::{GrepMode, GrepSearchOptions, grep_search, parse_grep_query};
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
 
-fn load_files(base_path: &Path) -> Vec<FileItem> {
+fn load_files(base_path: &Path) -> (Vec<FileItem>, *const u8) {
     use ignore::WalkBuilder;
 
     let mut files = Vec::new();
+    let mut rel_paths = Vec::new();
 
     WalkBuilder::new(base_path)
         .hidden(false)
@@ -34,24 +35,20 @@ fn load_files(base_path: &Path) -> Vec<FileItem> {
             let size = entry.metadata().ok().map_or(0, |m| m.len());
             let is_binary = detect_binary(&path, size);
 
-            let path_string = path.to_string_lossy().into_owned();
-            let relative_start = (path_string.len() - relative_path.len()) as u16;
-            let filename_start = path_string
-                .rfind('/')
-                .map(|i| i + 1)
-                .unwrap_or(relative_start as usize) as u16;
-            files.push(FileItem::new_raw(
-                &path_string,
-                relative_start,
-                filename_start,
-                size,
-                0,
-                None,
-                is_binary,
-            ));
+            let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+            files.push(FileItem::new_raw(filename_start, size, 0, None, is_binary));
+            rel_paths.push(relative_path);
         });
 
-    files
+    let (store, strings) =
+        fff::simd_path::build_chunked_path_store_from_strings(&rel_paths, &files);
+    let arena = store.arena_base_ptr();
+    for (i, file) in files.iter_mut().enumerate() {
+        file.set_path(strings[i].clone());
+    }
+    std::mem::forget(store);
+
+    (files, arena)
 }
 
 fn detect_binary(path: &Path, size: u64) -> bool {
@@ -67,7 +64,13 @@ fn detect_binary(path: &Path, size: u64) -> bool {
     buf[..n].contains(&0)
 }
 
-fn run_fuzzy_query(files: &[FileItem], query: &str, label: &str, base_path: &std::path::Path) {
+fn run_fuzzy_query(
+    files: &[FileItem],
+    query: &str,
+    label: &str,
+    base_path: &std::path::Path,
+    arena: *const u8,
+) {
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
@@ -93,6 +96,7 @@ fn run_fuzzy_query(files: &[FileItem], query: &str, label: &str, base_path: &std
         None,
         None,
         base_path,
+        arena,
     );
     let elapsed = start.elapsed();
 
@@ -117,7 +121,7 @@ fn run_fuzzy_query(files: &[FileItem], query: &str, label: &str, base_path: &std
         if m.file_index != current_file_idx {
             current_file_idx = m.file_index;
             let file = &result.files[m.file_index];
-            eprintln!("\n  ┌─ {}", file.relative_path());
+            eprintln!("\n  ┌─ {}", file.relative_path(arena));
         }
 
         // Truncate long lines for display
@@ -205,7 +209,7 @@ fn main() {
 
     eprintln!("Loading files...");
     let load_start = Instant::now();
-    let files = load_files(&canonical);
+    let (files, arena) = load_files(&canonical);
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     eprintln!(
         "Loaded {} files ({} non-binary) in {:.2}s\n",
@@ -216,23 +220,31 @@ fn main() {
 
     if queries.is_empty() {
         // Run default test queries
-        run_fuzzy_query(&files, "shcema", "transposition of 'schema'", &repo_path);
+        run_fuzzy_query(
+            &files,
+            "shcema",
+            "transposition of 'schema'",
+            &repo_path,
+            arena,
+        );
         run_fuzzy_query(
             &files,
             "SortedMap",
             "should match SortedArrayMap",
             &repo_path,
+            arena,
         );
         run_fuzzy_query(
             &files,
             "struct SortedMap",
             "should NOT match SourcingProjectMetadataParts",
             &repo_path,
+            arena,
         );
     } else {
         // Run user-provided queries
         for query in &queries {
-            run_fuzzy_query(&files, query, "user query", &repo_path);
+            run_fuzzy_query(&files, query, "user query", &repo_path, arena);
         }
     }
 

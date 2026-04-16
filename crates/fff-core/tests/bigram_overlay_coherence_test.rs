@@ -20,7 +20,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use fff_search::file_picker::{FFFMode, FilePicker, FuzzySearchOptions};
-use fff_search::grep::{parse_grep_query, GrepMode, GrepSearchOptions};
+use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 use fff_search::{FilePickerOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
 
 /// Stress test: 50 base files, 3 rounds of edits + deletes. New files
@@ -1090,6 +1090,7 @@ fn bigram_overlay_coherence_nested_directory_edits() {
 
 /// Helper: run a fuzzy search and return matched file paths.
 fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
+    let arena = picker.arena_base_ptr();
     let parser = QueryParser::default();
     let parsed = parser.parse(query);
     let result = FilePicker::fuzzy_search(
@@ -1104,12 +1105,12 @@ fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
             },
             ..Default::default()
         },
-        None,
+        arena,
     );
     result
         .items
         .iter()
-        .map(|f| f.relative_path().to_string())
+        .map(|f| f.relative_path(arena).to_string())
         .collect()
 }
 

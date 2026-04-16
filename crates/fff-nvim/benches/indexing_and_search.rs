@@ -1,11 +1,11 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use fff::file_picker::{FFFMode, FilePicker};
 use fff::types::{ContentCacheBudget, FileItem, PaginationArgs};
 use fff::{
-    build_bigram_index, grep, FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions,
-    QueryParser, SharedFrecency, SharedPicker,
+    FilePickerOptions, FuzzySearchOptions, GrepMode, GrepSearchOptions, QueryParser,
+    SharedFrecency, SharedPicker, build_bigram_index, grep,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Initialize tracing to output to console
@@ -105,12 +105,12 @@ fn wait_for_scan_completion(
 }
 
 /// Get files from the shared picker
-fn get_files_snapshot(shared_picker: &SharedPicker) -> Result<Vec<FileItem>, String> {
+fn get_files_snapshot(shared_picker: &SharedPicker) -> Result<(Vec<FileItem>, *const u8), String> {
     let picker_guard = shared_picker
         .read()
         .map_err(|_| "Failed to acquire read lock")?;
     if let Some(ref picker) = *picker_guard {
-        Ok(picker.get_files().to_vec())
+        Ok((picker.get_files().to_vec(), picker.arena_base_ptr()))
     } else {
         Err("FilePicker not initialized".to_string())
     }
@@ -126,7 +126,7 @@ fn cleanup_shared_state(shared_picker: &SharedPicker) {
 }
 
 /// Initialize FilePicker once and return files snapshot
-fn setup_once() -> Result<(Vec<FileItem>, SharedPicker, SharedFrecency), String> {
+fn setup_once() -> Result<(Vec<FileItem>, *const u8, SharedPicker, SharedFrecency), String> {
     init_tracing();
 
     let big_repo_path = PathBuf::from("./big-repo");
@@ -154,8 +154,8 @@ fn setup_once() -> Result<(Vec<FileItem>, SharedPicker, SharedFrecency), String>
         file_count
     );
 
-    let files = get_files_snapshot(&shared_picker)?;
-    Ok((files, shared_picker, shared_frecency))
+    let (files, arena) = get_files_snapshot(&shared_picker)?;
+    Ok((files, arena, shared_picker, shared_frecency))
 }
 
 /// Benchmark for indexing the big-repo directory
@@ -212,7 +212,7 @@ fn bench_indexing(c: &mut Criterion) {
 
 /// Benchmark for searching with various query patterns
 fn bench_search_queries(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprint!("Failed to setup picker {e:?}");
@@ -253,6 +253,7 @@ fn bench_search_queries(c: &mut Criterion) {
                             limit: 100,
                         },
                     },
+                    arena,
                 );
                 results.total_matched
             });
@@ -264,7 +265,7 @@ fn bench_search_queries(c: &mut Criterion) {
 
 /// Benchmark search with different thread counts
 fn bench_search_thread_scaling(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("⚠ Skipping thread scaling benchmarks: {}", e);
@@ -302,6 +303,7 @@ fn bench_search_thread_scaling(c: &mut Criterion) {
                                 limit: 100,
                             },
                         },
+                        arena,
                     );
                     results.total_matched
                 });
@@ -314,7 +316,7 @@ fn bench_search_thread_scaling(c: &mut Criterion) {
 
 /// Benchmark search with different result limits
 fn bench_search_result_limits(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("⚠ Skipping result limit benchmarks: {}", e);
@@ -349,6 +351,7 @@ fn bench_search_result_limits(c: &mut Criterion) {
                             limit: limit,
                         },
                     },
+                    arena,
                 );
                 results.total_matched
             });
@@ -360,7 +363,7 @@ fn bench_search_result_limits(c: &mut Criterion) {
 
 /// Benchmark search algorithm performance scaling with file count
 fn bench_search_scalability(c: &mut Criterion) {
-    let (all_files, _sp, _sf) = match setup_once() {
+    let (all_files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("⚠ Skipping scalability benchmarks: {}", e);
@@ -408,6 +411,7 @@ fn bench_search_scalability(c: &mut Criterion) {
                             limit: 100,
                         },
                     },
+                    arena,
                 );
                 results.total_matched
             });
@@ -419,7 +423,7 @@ fn bench_search_scalability(c: &mut Criterion) {
 
 /// Benchmark search performance with different ordering modes
 fn bench_search_ordering(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("⚠ Skipping ordering benchmarks: {}", e);
@@ -453,6 +457,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 100,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -477,6 +482,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 100,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -501,6 +507,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 500,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -524,6 +531,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 500,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -548,6 +556,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 10,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -571,6 +580,7 @@ fn bench_search_ordering(c: &mut Criterion) {
                         limit: 10,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -581,7 +591,7 @@ fn bench_search_ordering(c: &mut Criterion) {
 
 /// Benchmark pagination: first page vs deep page
 fn bench_pagination_performance(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("⚠ Skipping pagination benchmarks: {}", e);
@@ -616,6 +626,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -640,6 +651,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -664,6 +676,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
                         limit: page_size,
                     },
                 },
+                arena,
             );
             results.total_matched
         });
@@ -674,7 +687,7 @@ fn bench_pagination_performance(c: &mut Criterion) {
 
 /// Benchmark grep search with bigram index prefiltering
 fn bench_grep_search(c: &mut Criterion) {
-    let (files, _sp, _sf) = match setup_once() {
+    let (files, arena, _sp, _sf) = match setup_once() {
         Ok(result) => result,
         Err(e) => {
             eprintln!("Skipping grep benchmarks: {}", e);
@@ -687,7 +700,7 @@ fn bench_grep_search(c: &mut Criterion) {
     eprintln!("  Building bigram index for {} files...", files.len());
     let start = std::time::Instant::now();
     let (bigram_filter, _overflow_indices) =
-        build_bigram_index(&files, &budget, Path::new("./big-repo"));
+        build_bigram_index(&files, &budget, Path::new("./big-repo"), arena);
     eprintln!(
         "  Bigram index built in {:.2}s ({} columns)",
         start.elapsed().as_secs_f64(),
@@ -734,6 +747,7 @@ fn bench_grep_search(c: &mut Criterion) {
                     None,
                     None,
                     Path::new("./big-repo"),
+                    arena,
                 );
                 result.matches.len()
             });
@@ -751,6 +765,7 @@ fn bench_grep_search(c: &mut Criterion) {
                     None,
                     None,
                     Path::new("./big-repo"),
+                    arena,
                 );
                 result.matches.len()
             });
