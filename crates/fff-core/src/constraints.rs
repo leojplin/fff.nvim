@@ -1,18 +1,12 @@
-//! Constraint filtering engine for fff.
-//!
-//! This module provides the core constraint application logic that filters items
-//! based on parsed query constraints (extensions, path segments, globs, git status, etc.).
-//!
-//! The filtering is generic over the [`Constrainable`] trait, allowing reuse across
-//! different search modes (file picker, live grep, etc.).
+//! Constraint-based prefiltering for search queries.
 
 use ahash::AHashSet;
 use fff_query_parser::{Constraint, GitStatusFilter};
 use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
+use crate::simd_path::ArenaPtr;
 
-/// Case-insensitive ASCII substring search without allocation.
 /// `needle` must already be lowercase.
 #[inline]
 fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
@@ -38,24 +32,12 @@ fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Minimum item count before switching to parallel iteration with rayon.
-/// Below this threshold, the overhead of thread pool dispatch outweighs the benefit.
 const PAR_THRESHOLD: usize = 10_000;
 
-/// Trait for items that can be filtered by constraints.
-/// Implement this for any searchable item type (files, grep results, etc.).
-///
-/// All path accessors write into caller-provided buffers to avoid allocation
-/// on hot paths. The buffers must be at least 512 bytes.
-pub trait Constrainable {
-    /// Write the file name component into `out` (clears first, reuses buffer).
-    fn write_file_name(&self, arena: *const u8, out: &mut String);
-
-    /// The git status of this item, if available.
+pub(crate) trait Constrainable {
+    fn write_file_name(&self, arena: ArenaPtr, out: &mut String);
     fn git_status(&self) -> Option<git2::Status>;
-
-    /// Write the full relative path into `out` (clears first, reuses buffer).
-    fn write_relative_path(&self, arena: *const u8, out: &mut String);
+    fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
 }
 
 /// Check if a relative path ends with the given suffix at a `/` boundary (case-insensitive).
@@ -82,7 +64,6 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
     start == 0 || path_bytes[start - 1] == b'/'
 }
 
-/// Check if file extension matches (without allocation)
 #[inline]
 pub fn file_has_extension(file_name: &str, ext: &str) -> bool {
     let name_bytes = file_name.as_bytes();
@@ -94,9 +75,7 @@ pub fn file_has_extension(file_name: &str, ext: &str) -> bool {
     name_bytes.get(start) == Some(&b'.') && name_bytes[start + 1..].eq_ignore_ascii_case(ext_bytes)
 }
 
-/// Check if path contains segment (without allocation)
-/// Supports both single segments ("src") and multi-segment paths ("libswscale/aarch64").
-/// For "libswscale/aarch64", checks that these appear as consecutive path components.
+/// Supports multi-segment paths like "libswscale/aarch64" (consecutive components).
 #[inline]
 pub fn path_contains_segment(path: &str, segment: &str) -> bool {
     let path_bytes = path.as_bytes();
@@ -131,10 +110,8 @@ pub fn path_contains_segment(path: &str, segment: &str) -> bool {
     false
 }
 
-/// Check if an item at given index matches a constraint (single-pass friendly).
-///
-/// Callers provide reusable `String` buffers to avoid per-call allocation.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn item_matches_constraint_at_index<T: Constrainable>(
     item: &T,
     item_index: usize,
@@ -142,7 +119,7 @@ fn item_matches_constraint_at_index<T: Constrainable>(
     glob_results: &[(bool, AHashSet<usize>)],
     glob_idx: &mut usize,
     negate: bool,
-    arena: *const u8,
+    arena: ArenaPtr,
     fname_buf: &mut String,
     path_buf: &mut String,
 ) -> bool {
@@ -212,16 +189,12 @@ fn item_matches_constraint_at_index<T: Constrainable>(
     if negate { !matches } else { matches }
 }
 
-/// Apply constraint-based prefiltering in a single pass over all items.
 /// Returns `None` if no constraints are present, `Some(filtered)` otherwise.
-/// Multiple extension constraints (*.rs *.ts) are combined with OR logic.
-/// All other constraints are combined with AND logic.
-///
-/// Uses parallel iteration via rayon when the item count exceeds [`PAR_THRESHOLD`].
-pub fn apply_constraints<'a, T: Constrainable + Sync>(
+/// Extension constraints use OR logic; all others use AND.
+pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
     items: &'a [T],
     constraints: &[Constraint<'_>],
-    arena: *const u8,
+    arena: ArenaPtr,
 ) -> Option<Vec<&'a T>> {
     if constraints.is_empty() {
         return None;
@@ -264,8 +237,6 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
         Vec::new()
     };
 
-    let arena_ptr = crate::simd_path::ArenaPtr::new(arena);
-
     let filtered: Vec<&T> = if items.len() >= PAR_THRESHOLD {
         use rayon::prelude::*;
         items
@@ -275,7 +246,7 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
                 || (String::with_capacity(64), String::with_capacity(64)),
                 |(fname_buf, path_buf), (i, item)| {
                     if !extensions.is_empty() {
-                        item.write_file_name(arena_ptr.as_ptr(), fname_buf);
+                        item.write_file_name(arena, fname_buf);
                         if !extensions
                             .iter()
                             .any(|ext| file_has_extension(fname_buf, ext))
@@ -293,7 +264,7 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
                             &glob_results,
                             &mut glob_idx,
                             false,
-                            arena_ptr.as_ptr(),
+                            arena,
                             fname_buf,
                             path_buf,
                         )
@@ -315,7 +286,7 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
             .enumerate()
             .filter(|&(i, item)| {
                 if !extensions.is_empty() {
-                    item.write_file_name(arena_ptr.as_ptr(), &mut fname_buf);
+                    item.write_file_name(arena, &mut fname_buf);
                     if !extensions
                         .iter()
                         .any(|ext| file_has_extension(&fname_buf, ext))
@@ -333,7 +304,7 @@ pub fn apply_constraints<'a, T: Constrainable + Sync>(
                         &glob_results,
                         &mut glob_idx,
                         false,
-                        arena_ptr.as_ptr(),
+                        arena,
                         &mut fname_buf,
                         &mut path_buf,
                     )

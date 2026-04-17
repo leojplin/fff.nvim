@@ -64,7 +64,6 @@ fn test_search_memory_pattern(
     name: &str,
     iterations: usize,
     query_pattern: impl Fn(usize) -> String,
-    arena: *const u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🧪 {}", name);
 
@@ -88,8 +87,7 @@ fn test_search_memory_pattern(
             if let Some(ref picker) = *guard {
                 let parser = QueryParser::default();
                 let parsed = parser.parse(&query);
-                let search_result = FilePicker::fuzzy_search(
-                    picker.get_files(),
+                let search_result = picker.fuzzy_search(
                     &parsed,
                     None,
                     FuzzySearchOptions {
@@ -103,7 +101,6 @@ fn test_search_memory_pattern(
                             limit: 50 + (i % 50),
                         },
                     },
-                    arena,
                 );
                 (search_result.items.len(), search_result.total_matched)
             } else {
@@ -216,11 +213,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("📊 Found {} files", file_count);
 
-    let arena = {
-        let guard = shared_picker.read().unwrap();
-        guard.as_ref().unwrap().arena_base_ptr()
-    };
-
     let (initial_allocated, initial_active, initial_resident) = get_mem_stat()?;
     println!("🧠 Baseline memory:");
     println!("   Allocated: {}", format_bytes(initial_allocated));
@@ -231,36 +223,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test different memory patterns
 
     // 1. Repeated same query - should have minimal growth if caching works
-    test_search_memory_pattern(
-        &shared_picker,
-        "Same Query Repeated (1000x)",
-        1000,
-        |_| "test".to_string(),
-        arena,
-    )?;
+    test_search_memory_pattern(&shared_picker, "Same Query Repeated (1000x)", 1000, |_| {
+        "test".to_string()
+    })?;
 
     // 2. Cycling through different queries
-    test_search_memory_pattern(
-        &shared_picker,
-        "Cycling Queries (1000x)",
-        1000,
-        |i| {
-            let queries = [
-                "test", "main", "lib", "src", "mod", "file", "picker", "fuzzy", "search",
-            ];
-            queries[i % queries.len()].to_string()
-        },
-        arena,
-    )?;
+    test_search_memory_pattern(&shared_picker, "Cycling Queries (1000x)", 1000, |i| {
+        let queries = [
+            "test", "main", "lib", "src", "mod", "file", "picker", "fuzzy", "search",
+        ];
+        queries[i % queries.len()].to_string()
+    })?;
 
     // 3. Unique queries each time - worst case for any caching
-    test_search_memory_pattern(
-        &shared_picker,
-        "Unique Queries (500x)",
-        500,
-        |i| format!("unique_query_{}", i),
-        arena,
-    )?;
+    test_search_memory_pattern(&shared_picker, "Unique Queries (500x)", 500, |i| {
+        format!("unique_query_{}", i)
+    })?;
 
     // 4. Queries that return many results
     test_search_memory_pattern(
@@ -268,31 +246,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "High Result Count (500x)",
         500,
         |_| "a".to_string(), // Single character likely to match many files
-        arena,
     )?;
 
     // 5. Queries with no results
-    test_search_memory_pattern(
-        &shared_picker,
-        "No Results (500x)",
-        500,
-        |_| "zzzz_no_match_expected".to_string(),
-        arena,
-    )?;
+    test_search_memory_pattern(&shared_picker, "No Results (500x)", 500, |_| {
+        "zzzz_no_match_expected".to_string()
+    })?;
 
     // 6. Long intensive test
-    test_search_memory_pattern(
-        &shared_picker,
-        "Long Intensive Test (2000x)",
-        2000,
-        |i| {
-            let patterns = [
-                "rs", "lua", "toml", "mod", "lib", "main", "test", "src", "file",
-            ];
-            format!("{}{}", patterns[i % patterns.len()], i % 100)
-        },
-        arena,
-    )?;
+    test_search_memory_pattern(&shared_picker, "Long Intensive Test (2000x)", 2000, |i| {
+        let patterns = [
+            "rs", "lua", "toml", "mod", "lib", "main", "test", "src", "file",
+        ];
+        format!("{}{}", patterns[i % patterns.len()], i % 100)
+    })?;
 
     let (final_allocated, final_active, final_resident) = get_mem_stat()?;
 

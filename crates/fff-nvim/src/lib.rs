@@ -215,10 +215,7 @@ pub fn fuzzy_search_files(
     let parser = QueryParser::new(FileSearchConfig);
     let parsed = parser.parse(&query);
 
-    let files = picker.get_files();
-    let arena = picker.arena_base_ptr();
-    let results = FilePicker::fuzzy_search(
-        files,
+    let results = picker.fuzzy_search(
         &parsed,
         query_tracker_guard.as_ref(),
         FuzzySearchOptions {
@@ -232,7 +229,6 @@ pub fn fuzzy_search_files(
                 limit: page_size.unwrap_or(0),
             },
         },
-        arena,
     );
 
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
@@ -256,14 +252,14 @@ pub fn fuzzy_search_files(
                     location: parsed.location,
                 };
 
-                return lua_types::SearchResultLua::new(found, arena).into_lua(lua);
+                return lua_types::SearchResultLua::new(found, picker).into_lua(lua);
             }
 
             return build_file_path_fallback(lua, &path, results.total_files);
         }
     }
 
-    lua_types::SearchResultLua::new(results, arena).into_lua(lua)
+    lua_types::SearchResultLua::new(results, picker).into_lua(lua)
 }
 
 #[allow(clippy::type_complexity)]
@@ -315,11 +311,11 @@ pub fn live_grep(
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: trim_whitespace.unwrap_or(false),
+        abort_signal: None,
     };
 
-    let arena = picker.arena_base_ptr();
     let result = picker.grep(&parsed, &options);
-    lua_types::GrepResultLua::new(result, arena).into_lua(lua)
+    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but
@@ -334,7 +330,6 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     let path_str = path.to_string_lossy().to_string();
 
     let item = lua.create_table()?;
-    item.set("path", path_str.as_str())?;
     item.set("relative_path", path_str.as_str())?;
     item.set("name", name.as_str())?;
     item.set("size", path.metadata().map(|m| m.len()).unwrap_or(0))?;
@@ -433,6 +428,15 @@ pub fn get_git_root(_: &Lua, _: ()) -> LuaResult<Option<String>> {
     };
 
     Ok(picker.git_root().map(|p| p.to_string_lossy().into_owned()))
+}
+
+pub fn get_base_path(_: &Lua, _: ()) -> LuaResult<Option<String>> {
+    let file_picker = FILE_PICKER.read().into_lua_result()?;
+    let Some(ref picker) = *file_picker else {
+        return Ok(None);
+    };
+
+    Ok(Some(picker.base_path().to_string_lossy().into_owned()))
 }
 
 pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
@@ -807,6 +811,7 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         lua.create_function(refresh_git_status)?,
     )?;
     exports.set("get_git_root", lua.create_function(get_git_root)?)?;
+    exports.set("get_base_path", lua.create_function(get_base_path)?)?;
     exports.set(
         "stop_background_monitor",
         lua.create_function(stop_background_monitor)?,

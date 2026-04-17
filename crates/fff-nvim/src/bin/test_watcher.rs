@@ -60,7 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_count = {
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
-        let arena = picker.arena_base_ptr();
         let files = picker.get_files();
         println!("Initial file count: {}", files.len());
 
@@ -70,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  {}. {} ({})",
                     i + 1,
-                    file.relative_path(arena),
+                    picker.relative_path(file),
                     format_git_status(file.git_status)
                 );
             }
@@ -110,11 +109,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Show some recently added files
                 let guard = shared_picker.read().unwrap();
                 let picker = guard.as_ref().unwrap();
-                let arena = picker.arena_base_ptr();
                 let files = picker.get_files();
                 let newest_files = files.iter().rev().take(added.min(3));
                 for file in newest_files {
-                    println!("   ➕ {}", file.relative_path(arena));
+                    println!("   ➕ {}", picker.relative_path(file));
                 }
             } else {
                 let removed = last_count - current_count;
@@ -156,12 +154,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let timestamp = chrono::Local::now().format("%H:%M:%S");
             let guard = shared_picker.read().unwrap();
             let picker_ref = guard.as_ref().unwrap();
-            let arena = picker_ref.arena_base_ptr();
-            let files = picker_ref.get_files();
             let parser = QueryParser::default();
             let parsed = parser.parse("rs");
-            let search_results = FilePicker::fuzzy_search(
-                files,
+            let search_results = picker_ref.fuzzy_search(
                 &parsed,
                 None,
                 FuzzySearchOptions {
@@ -175,7 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         limit: 5,
                     },
                 },
-                arena,
             );
 
             println!(
@@ -193,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "   {}. {} (score: {})",
                     i + 1,
-                    file.relative_path(arena),
+                    picker_ref.relative_path(file),
                     score.total
                 );
             }

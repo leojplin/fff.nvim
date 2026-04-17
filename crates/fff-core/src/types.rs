@@ -1,12 +1,11 @@
 use std::io::Read;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
-use crate::simd_path::PATH_BUF_SIZE;
+use crate::simd_path::{ArenaPtr, PATH_BUF_SIZE};
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
 
 /// Cached file contents — mmap on Unix, heap buffer on Windows.
@@ -43,91 +42,56 @@ impl FileItemFlags {
     /// Tombstone — file was deleted but index slot is preserved so
     /// bigram indices for other files stay valid.
     pub const DELETED: u8 = 1 << 1;
+    /// File was added after the last full reindex; its ChunkedString
+    /// indices point into the overflow builder arena, not the base arena.
+    pub const OVERFLOW: u8 = 1 << 2;
 }
 
-/// A directory entry with aggregated metadata from its child files.
-/// Stored in a sorted `Vec<DirItem>` (the "dir table") inside `FileSync`,
-/// giving O(log n) lookup by path and enabling directory picker mode.
+/// A directory in the file index. Shares chunk arena with file paths.
 #[derive(Debug, Clone)]
 pub struct DirItem {
-    /// Absolute path of the directory (with trailing separator removed).
-    path: String,
-    /// Byte offset where the relative path begins.
-    relative_start: u16,
+    /// Relative dir path (e.g. `src/components/`). Chunk indices point into
+    /// the same dedup'd arena as `FileItem.path`.
+    pub(crate) path: crate::simd_path::ChunkedString,
 }
 
 impl DirItem {
-    pub fn new(path: String, relative_start: u16) -> Self {
-        Self {
-            path,
-            relative_start,
+    pub(crate) fn new(path: crate::simd_path::ChunkedString) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn read_relative_path<'a>(&self, arena: ArenaPtr, buf: &'a mut [u8]) -> &'a str {
+        self.path.read_to_buf(arena, buf)
+    }
+
+    /// Relative dir path as owned String (cold path).
+    pub fn relative_path(&self, arena: ArenaPtr) -> String {
+        let mut out = String::new();
+        self.path.write_to_string(arena, &mut out);
+        out
+    }
+
+    /// A path = base_path + "/" + relative. Cold path, allocates.
+    pub fn absolute_path(&self, arena: ArenaPtr, base_path: &Path) -> PathBuf {
+        let rel = self.relative_path(arena);
+        if rel.is_empty() {
+            base_path.to_path_buf()
+        } else {
+            base_path.join(&rel)
         }
     }
-
-    /// The full absolute path as a string slice.
-    #[inline]
-    pub fn path_str(&self) -> &str {
-        &self.path
-    }
-
-    /// The full absolute path as a `&Path`.
-    #[inline]
-    pub fn as_path(&self) -> &Path {
-        Path::new(&self.path)
-    }
-
-    /// The relative path from the base directory (without trailing separator).
-    /// For the base directory itself, returns "".
-    #[inline]
-    pub fn relative_path(&self) -> &str {
-        &self.path[self.relative_start as usize..]
-    }
 }
 
-impl neo_frizbee::Matchable for DirItem {
-    #[inline]
-    fn match_str(&self) -> Option<&str> {
-        let rel = self.relative_path();
-        if rel.is_empty() { None } else { Some(rel) }
-    }
-}
-
-/// A single indexed file with metadata, frecency scores, and lazy content cache.
-///
-/// File contents are initialized lazily on the first grep access and cached for
-/// subsequent searches. On Unix, uses mmap backed by the kernel page cache. On
-/// Windows, reads into a heap buffer to avoid holding file handles open.
-///
-/// Thread-safety: `OnceLock` provides lock-free reads after initialization.
-/// Each file is only searched by one rayon worker at a time via `par_iter`.
-///
-/// Path storage uses a `ChunkedString` backed by the shared SIMD chunk arena.
-/// The `ChunkedString` stores indices into deduplicated 16-byte chunks and
-/// knows the filename offset, enabling zero-copy SIMD matching and efficient
-/// dir/filename extraction.
 #[derive(Debug)]
 pub struct FileItem {
-    /// File size in bytes
     pub size: u64,
-    /// Modification time in UNIX timestamp
     pub modified: u64,
-    /// Frecency access score
     pub access_frecency_score: i16,
-    /// Frecency modification score
     pub modification_frecency_score: i16,
-    /// The file's git status
     pub git_status: Option<git2::Status>,
-
-    /// Relative path stored as indices into the shared SIMD chunk arena.
-    /// Knows the filename offset for efficient dir/filename extraction.
-    /// Initialized as `empty()` during walk phase, then populated by
-    /// `build_chunked_path_store_from_strings` or set directly via `set_path`.
-    pub path: crate::simd_path::ChunkedString,
-    /// Index into the dir table (`FileSync::dirs`).
+    pub(crate) path: crate::simd_path::ChunkedString,
     parent_dir: u32,
-    /// Packed boolean flags — see `FileItemFlags`.
     flags: u8,
-    /// Lazily-initialized file contents for grep.
     content: OnceLock<FileContent>,
 }
 
@@ -142,21 +106,13 @@ impl Clone for FileItem {
             modification_frecency_score: self.modification_frecency_score,
             git_status: self.git_status,
             flags: self.flags,
+            // on clone we have to reset the cointent lock
             content: OnceLock::new(),
         }
     }
 }
 
 impl FileItem {
-    /// Create a new `FileItem` with an empty `ChunkedString` placeholder.
-    ///
-    /// The `filename_start` is stored in `path.filename_offset` so the
-    /// arena builder knows the dir/filename split point. The path data
-    /// itself is NOT functional until `set_path` populates it.
-    ///
-    /// For test convenience, callers that don't use the arena builder can
-    /// construct a `ChunkedString` via `build_chunked_path_store_from_strings`
-    /// and then assign it with `set_path`.
     pub fn new_raw(
         filename_start: u16,
         size: u64,
@@ -185,83 +141,64 @@ impl FileItem {
         }
     }
 
-    /// Replace this item's path with a fully-initialized `ChunkedString`.
-    #[inline]
-    pub fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
+    /// Returns an absolute path of the file
+    pub fn absolute_path(&self, arena: ArenaPtr, base_path: &Path) -> PathBuf {
+        let mut buf = [0u8; PATH_BUF_SIZE];
+        let rel = self.path.read_to_buf(arena, &mut buf);
+        base_path.join(rel)
+    }
+
+    pub(crate) fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
         self.path = path;
     }
 
-    /// Index into the dir table for this file's parent directory.
-    #[inline]
-    pub fn parent_dir_index(&self) -> u32 {
+    pub(crate) fn parent_dir_index(&self) -> u32 {
         self.parent_dir
     }
 
-    /// Set the parent directory index.
-    #[inline]
-    pub fn set_parent_dir(&mut self, idx: u32) {
+    pub(crate) fn set_parent_dir(&mut self, idx: u32) {
         self.parent_dir = idx;
     }
 
-    /// The directory portion of the relative path.
-    /// Pre-allocates with 64 bytes capacity; reuses on subsequent calls
-    /// if the caller passes the return value back via `write_dir_str`.
-    #[inline]
-    pub fn dir_str(&self, arena: *const u8) -> String {
+    pub(crate) fn dir_str(&self, arena: ArenaPtr) -> String {
         let mut s = String::with_capacity(64);
         self.path.write_dir_to(arena, &mut s);
         s
     }
 
-    /// Write the directory portion into a reusable `String`.
-    #[inline]
-    pub fn write_dir_str(&self, arena: *const u8, out: &mut String) {
+    pub(crate) fn write_dir_str(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_dir_to(arena, out);
     }
 
-    /// The filename component.
-    #[inline]
-    pub fn file_name(&self, arena: *const u8) -> String {
+    pub(crate) fn file_name_from_arena(&self, arena: ArenaPtr) -> String {
         let mut s = String::with_capacity(32);
-        self.path.write_file_name_to(arena, &mut s);
+        self.path.write_filename_to(arena, &mut s);
         s
     }
 
-    /// Write the filename into a reusable `String`.
-    #[inline]
-    pub fn write_file_name(&self, arena: *const u8, out: &mut String) {
-        self.path.write_file_name_to(arena, out);
+    pub(crate) fn write_file_name_from_arena(&self, arena: ArenaPtr, out: &mut String) {
+        self.path.write_filename_to(arena, out);
     }
 
-    /// The full relative path.
-    #[inline]
-    pub fn relative_path(&self, arena: *const u8) -> String {
+    pub(crate) fn relative_path_from_arena(&self, arena: ArenaPtr) -> String {
         let mut s = String::with_capacity(64);
         self.path.write_to_string(arena, &mut s);
         s
     }
 
-    /// Write the full relative path into a reusable `String`.
-    #[inline]
-    pub fn write_relative_path(&self, arena: *const u8, out: &mut String) {
+    pub(crate) fn write_relative_path_from_arena(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_to_string(arena, out);
     }
 
-    /// Total byte length of the relative path.
-    #[inline]
     pub fn relative_path_len(&self) -> usize {
         self.path.byte_len as usize
     }
 
-    /// Byte offset of the filename within the relative path.
-    #[inline]
-    pub fn filename_offset_in_relative(&self) -> usize {
+    pub fn filename_offset_in_relative_path(&self) -> usize {
         self.path.filename_offset as usize
     }
 
-    /// Check if the relative path equals `other` without heap allocation.
-    #[inline]
-    pub fn relative_path_eq(&self, arena: *const u8, other: &str) -> bool {
+    pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
         if other.len() != self.path.byte_len as usize {
             return false;
         }
@@ -270,39 +207,15 @@ impl FileItem {
         mine == other
     }
 
-    /// Check if the relative path ends with `suffix` without heap allocation.
-    #[inline]
-    pub fn relative_path_ends_with(&self, arena: *const u8, suffix: &str) -> bool {
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let path = self.path.read_to_buf(arena, &mut buf);
-        if suffix.len() > path.len() {
-            return false;
-        }
-        path.ends_with(suffix)
-    }
-
-    /// Check if the relative path starts with `prefix` without heap allocation.
-    #[inline]
-    pub fn relative_path_starts_with(&self, arena: *const u8, prefix: &str) -> bool {
+    pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
         let mut buf = [0u8; PATH_BUF_SIZE];
         let path = self.path.read_to_buf(arena, &mut buf);
         path.starts_with(prefix)
     }
 
-    /// Reconstruct the full absolute path. Cold-path only (allocates).
-    #[inline]
-    pub fn absolute_path(&self, arena: *const u8, base_path: &Path) -> PathBuf {
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let rel = self.path.read_to_buf(arena, &mut buf);
-        base_path.join(rel)
-    }
-
-    /// Write the full absolute path into a caller-provided buffer (zero-alloc).
-    /// Returns `&Path` over the written bytes.
-    #[inline]
-    pub fn write_absolute_path<'a>(
+    pub(crate) fn write_absolute_path<'a>(
         &self,
-        arena: *const u8,
+        arena: ArenaPtr,
         base_path: &Path,
         buf: &'a mut [u8; PATH_BUF_SIZE],
     ) -> &'a Path {
@@ -357,6 +270,20 @@ impl FileItem {
             self.flags &= !FileItemFlags::DELETED;
         }
     }
+
+    #[inline]
+    pub fn is_overflow(&self) -> bool {
+        self.flags & FileItemFlags::OVERFLOW != 0
+    }
+
+    #[inline]
+    pub fn set_overflow(&mut self, val: bool) {
+        if val {
+            self.flags |= FileItemFlags::OVERFLOW;
+        } else {
+            self.flags &= !FileItemFlags::OVERFLOW;
+        }
+    }
 }
 
 impl FileItem {
@@ -382,9 +309,9 @@ impl FileItem {
     /// of the budget should use [`get_content_for_search`].
     ///
     /// After the first call, this is lock-free (just an atomic load + pointer deref).
-    pub fn get_content(
+    pub(crate) fn get_content(
         &self,
-        arena: *const u8,
+        arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&[u8]> {
@@ -419,14 +346,19 @@ impl FileItem {
 
     /// Get file content for searching — **always returns content** for eligible
     /// files, even when the persistent cache budget is exhausted.
+    ///
+    /// The caller provides a reusable `path_buf` (pre-filled with `base_path/`)
+    /// and its `base_len` to avoid allocations when constructing the absolute path.
     #[inline]
-    pub fn get_content_for_search<'a>(
+    pub(crate) fn get_content_for_search<'a>(
         &'a self,
-        buf: &'a mut Vec<u8>,
+        buf: &'a mut Vec<u8>, // we allow it to grow
+        arena: ArenaPtr,
+        base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&'a [u8]> {
         // Fast path: persistent cache hit (zero-copy).
-        if let Some(cached) = self.get_content(budget) {
+        if let Some(cached) = self.get_content(arena, base_path, budget) {
             return Some(cached);
         }
 
@@ -439,25 +371,21 @@ impl FileItem {
         // No mmap()/munmap() syscalls, no page table setup/teardown.
         // We know the exact size so we use read_exact (1 read syscall) instead of
         // read_to_end (2 read syscalls — one for data, one for EOF confirmation).
+        let abs = self.absolute_path(arena, base_path);
         let len = self.size as usize;
         buf.resize(len, 0);
-        let mut file = std::fs::File::open(self.as_path()).ok()?;
+        let mut file = std::fs::File::open(&abs).ok()?;
         file.read_exact(buf).ok()?;
         Some(buf.as_slice())
     }
 }
 
-/// Page size on Apple Silicon is 16KB; on x86-64 it's 4KB.
 /// Files smaller than one page waste the remainder when mmapped.
-/// Reading them into a heap buffer avoids this overhead.
 #[cfg(target_arch = "aarch64")]
 const MMAP_THRESHOLD: u64 = 16 * 1024;
 #[cfg(not(target_arch = "aarch64"))]
 const MMAP_THRESHOLD: u64 = 4 * 1024;
 
-/// Load file contents: small files are read into a heap buffer to avoid
-/// mmap page alignment waste; large files use mmap for zero-copy access.
-/// On Windows, always uses heap buffer (mmap holds the file handle open).
 fn load_file_content(path: &Path, size: u64) -> Option<FileContent> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -484,12 +412,12 @@ fn load_file_content(path: &Path, size: u64) -> Option<FileContent> {
 
 impl Constrainable for FileItem {
     #[inline]
-    fn write_file_name(&self, arena: *const u8, out: &mut String) {
-        self.path.write_file_name_to(arena, out);
+    fn write_file_name(&self, arena: ArenaPtr, out: &mut String) {
+        self.path.write_filename_to(arena, out);
     }
 
     #[inline]
-    fn write_relative_path(&self, arena: *const u8, out: &mut String) {
+    fn write_relative_path(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_to_string(arena, out);
     }
 
@@ -530,14 +458,8 @@ impl Default for PaginationArgs {
     }
 }
 
-/// Context for scoring files during search.
-///
-/// The `query` field contains the pre-parsed query with constraints,
-/// fuzzy parts, and location information. Parsing is done once at the API
-/// boundary and passed through.
 #[derive(Debug, Clone)]
 pub struct ScoringContext<'a> {
-    /// Parsed query containing raw text, constraints, fuzzy parts, and location
     pub query: &'a FFFQuery<'a>,
     pub project_path: Option<&'a Path>,
     pub current_file: Option<&'a str>,
@@ -550,8 +472,6 @@ pub struct ScoringContext<'a> {
 }
 
 impl ScoringContext<'_> {
-    /// Get the effective fuzzy query string for matching.
-    /// Returns the first fuzzy part, or the raw query if no parsing was done.
     pub fn effective_query(&self) -> &str {
         match &self.query.fuzzy_query {
             FuzzyQuery::Text(t) => t,
@@ -572,20 +492,8 @@ pub struct SearchResult<'a> {
 
 const MAX_MMAP_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
-// Limits the total number of files (and bytes) whose content is kept in
-// memory via the `OnceLock<FileContent>` cache. On Unix every cached file
-// holds a live `mmap`, which consumes a kernel `vm_map_entry`. On a 500k-file
-// monorepo, caching everything exhausts macOS/Linux kernel resources and
-// crashes the machine (see issue #294).
-//
-// Each `FilePicker` owns its own `ContentCacheBudget`. The budget is passed
-// to `grep_search` and `warmup_mmaps` so that multiple pickers can coexist
-// without interfering with each other's counters.
-
 const MAX_CACHED_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Per-picker budget controlling how many files may have their content
-/// persistently cached (mmap on Unix, heap buffer on Windows).
 #[derive(Debug)]
 pub struct ContentCacheBudget {
     pub max_files: usize,
@@ -596,8 +504,6 @@ pub struct ContentCacheBudget {
 }
 
 impl ContentCacheBudget {
-    /// No limits — every eligible file is cached. Useful for tests and
-    /// short-lived tools that don't need resource protection.
     pub fn unlimited() -> Self {
         Self {
             max_files: usize::MAX,
@@ -644,8 +550,6 @@ impl ContentCacheBudget {
         }
     }
 
-    /// Reset the counters. Called when the file index is rebuilt (rescan /
-    /// directory change) and all old `FileItem`s are dropped.
     pub fn reset(&self) {
         self.cached_count.store(0, Ordering::Relaxed);
         self.cached_bytes.store(0, Ordering::Relaxed);
@@ -659,15 +563,7 @@ impl Default for ContentCacheBudget {
 }
 
 impl FileItem {
-    /// Create a FileItem with a fully functional ChunkedString path.
-    ///
-    /// Builds a single-file ChunkedPathStore and **leaks** it so the arena
-    /// pointer remains valid forever. Only appropriate for tests and short-lived
-    /// tools — production code should use `build_chunked_path_store_from_strings`
-    /// and `set_path` instead.
-    ///
-    /// Returns `(item, arena_base)` — callers that need to read path data must
-    /// pass the arena pointer to `relative_path(arena)`, `file_name(arena)`, etc.
+    /// Leaks a single-file arena so the pointer stays valid forever.
     #[doc(hidden)]
     pub fn new_for_test(
         rel_path: &str,
@@ -676,30 +572,20 @@ impl FileItem {
         git_status: Option<git2::Status>,
         is_binary: bool,
     ) -> Self {
-        let filename_start = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-        let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
-        let paths = [rel_path.to_string()];
-        let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
-            &paths,
-            std::slice::from_ref(&item),
-        );
-        let mut cs = strings.into_iter().next().unwrap();
-        cs.set_arena_override(store.arena_base_ptr());
-        item.set_path(cs);
-        // Leak the store so the arena pointer stays valid forever.
-        std::mem::forget(store);
+        let (item, _arena) =
+            Self::new_for_test_with_arena(rel_path, size, modified, git_status, is_binary);
         item
     }
 
-    /// Like [`new_for_test`] but also returns the arena base pointer.
+    /// Test helper returning both the item and leaked arena pointer.
     #[doc(hidden)]
-    pub fn new_for_test_with_arena(
+    pub(crate) fn new_for_test_with_arena(
         rel_path: &str,
         size: u64,
         modified: u64,
         git_status: Option<git2::Status>,
         is_binary: bool,
-    ) -> (Self, *const u8) {
+    ) -> (Self, ArenaPtr) {
         let filename_start = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
         let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
         let paths = [rel_path.to_string()];
@@ -707,9 +593,8 @@ impl FileItem {
             &paths,
             std::slice::from_ref(&item),
         );
-        let mut cs = strings.into_iter().next().unwrap();
-        let arena = store.arena_base_ptr();
-        cs.set_arena_override(arena);
+        let cs = strings.into_iter().next().unwrap();
+        let arena = store.as_arena_ptr();
         item.set_path(cs);
         std::mem::forget(store);
         (item, arena)

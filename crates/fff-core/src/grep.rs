@@ -23,6 +23,7 @@ use fff_query_parser::{Constraint, FFFQuery, GrepConfig, QueryParser};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Level;
 
@@ -159,7 +160,6 @@ fn starts_with_include(s: &[u8]) -> bool {
 }
 
 /// Determine whether `text` contains any regex metacharacters.
-///
 /// Uses `regex::escape` from the regex crate as the source of truth — if the
 /// escaped form differs from the original, the text contains characters that
 /// would be interpreted as regex syntax. This is deterministic and always in
@@ -361,6 +361,11 @@ pub struct GrepSearchOptions {
     /// highlight byte offsets accordingly. Useful for AI/MCP consumers and UIs
     /// that don't need indentation. Default: false.
     pub trim_whitespace: bool,
+    /// External abort signal. When provided, overrides the picker's internal
+    /// cancellation flag. Set to `true` to stop the search early and return
+    /// partial results. Omit (or use `..Default::default()`) to let the
+    /// picker manage cancellation.
+    pub abort_signal: Option<Arc<AtomicBool>>,
 }
 
 impl Default for GrepSearchOptions {
@@ -377,6 +382,7 @@ impl Default for GrepSearchOptions {
             after_context: 0,
             classify_definitions: false,
             trim_whitespace: false,
+            abort_signal: None,
         }
     }
 }
@@ -388,9 +394,21 @@ struct GrepContext<'a, 'b> {
     budget: &'a ContentCacheBudget,
     base_path: &'a Path,
     arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
     prefilter: Option<&'a memchr::memmem::Finder<'b>>,
     prefilter_case_insensitive: bool,
-    is_cancelled: Option<&'a AtomicBool>,
+    abort_signal: &'a AtomicBool,
+}
+
+impl GrepContext<'_, '_> {
+    #[inline]
+    fn arena_for_file(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
+        if file.is_overflow() {
+            self.overflow_arena
+        } else {
+            self.arena
+        }
+    }
 }
 
 /// Lightweight wrapper around `regex::bytes::Regex` implementing the
@@ -929,7 +947,7 @@ impl Sink for AhoCorasickSink<'_> {
 ///
 /// Returns the same `GrepResult` type as `grep_search`.
 #[allow(clippy::too_many_arguments)]
-pub fn multi_grep_search<'a>(
+pub(crate) fn multi_grep_search<'a>(
     files: &'a [FileItem],
     patterns: &[&str],
     constraints: &[fff_query_parser::Constraint<'_>],
@@ -937,9 +955,10 @@ pub fn multi_grep_search<'a>(
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
-    is_cancelled: Option<&AtomicBool>,
+    abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: *const u8,
+    arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
     let total_files = files.len();
 
@@ -1054,10 +1073,11 @@ pub fn multi_grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
-            arena: crate::simd_path::ArenaPtr::new(arena),
+            arena,
+            overflow_arena,
             prefilter: None, // no memmem prefilter for multi-pattern search
             prefilter_case_insensitive: false,
-            is_cancelled,
+            abort_signal,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
@@ -1225,9 +1245,7 @@ where
                 // allocatge a single reusable buffer per thread
                 || Vec::with_capacity(64 * 1024),
                 |buf, (local_idx, file)| {
-                    if let Some(flag) = ctx.is_cancelled
-                        && flag.load(Ordering::Relaxed)
-                    {
+                    if ctx.abort_signal.load(Ordering::Relaxed) {
                         budget_exceeded.store(true, Ordering::Relaxed);
                         return None;
                     }
@@ -1240,7 +1258,12 @@ where
                         return None;
                     }
 
-                    let content = file.get_content_for_search(buf, ctx.budget)?;
+                    let content = file.get_content_for_search(
+                        buf,
+                        ctx.arena_for_file(file),
+                        ctx.base_path,
+                        ctx.budget,
+                    )?;
 
                     // Fast whole-file memmem check before entering the
                     // grep-searcher machinery. Skips Vec alloc, Searcher
@@ -1410,7 +1433,7 @@ fn prepare_files_to_search<'a>(
     files: &'a [FileItem],
     constraints: &[fff_query_parser::Constraint<'_>],
     options: &GrepSearchOptions,
-    arena: *const u8,
+    arena: crate::simd_path::ArenaPtr,
 ) -> (Vec<&'a FileItem>, usize) {
     let prefiltered: Vec<&FileItem> = if constraints.is_empty() {
         files
@@ -1501,9 +1524,10 @@ fn fuzzy_grep_search<'a>(
     filtered_file_count: usize,
     case_insensitive: bool,
     budget: &ContentCacheBudget,
-    is_cancelled: Option<&AtomicBool>,
+    abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: *const u8,
+    arena: crate::simd_path::ArenaPtr,
+    _overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" → "schema") costs ~1 typo with
@@ -1590,8 +1614,6 @@ fn fuzzy_grep_search<'a>(
     let search_start = std::time::Instant::now();
     let budget_exceeded = AtomicBool::new(false);
     let max_matches_per_file = options.max_matches_per_file;
-    let arena_ptr = crate::simd_path::ArenaPtr::new(arena);
-
     // Parallel phase with `map_init`: each rayon worker thread clones the
     // matcher once and gets a reusable read buffer. The buffer avoids
     // mmap/munmap syscalls for non-cached files.
@@ -1601,9 +1623,7 @@ fn fuzzy_grep_search<'a>(
         .map_init(
             || (matcher.clone(), Vec::with_capacity(64 * 1024)),
             |(matcher, buf), (idx, file)| {
-                if let Some(flag) = is_cancelled
-                    && flag.load(Ordering::Relaxed)
-                {
+                if abort_signal.load(Ordering::Relaxed) {
                     budget_exceeded.store(true, Ordering::Relaxed);
                     return None;
                 }
@@ -1615,7 +1635,7 @@ fn fuzzy_grep_search<'a>(
                     return None;
                 }
 
-                let file_bytes = file.get_content_for_search(buf, budget)?;
+                let file_bytes = file.get_content_for_search(buf, arena, base_path, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.
@@ -1805,18 +1825,19 @@ fn fuzzy_grep_search<'a>(
 ///
 /// When `query` is empty, returns git-modified/untracked files sorted by
 /// frecency for the "welcome state" UI.
-#[tracing::instrument(skip(files, options, budget, bigram_index, bigram_overlay, is_cancelled), fields(file_count = files.len()))]
+#[tracing::instrument(skip_all, fields(file_count = files.len()))]
 #[allow(clippy::too_many_arguments)]
-pub fn grep_search<'a>(
+pub(crate) fn grep_search<'a>(
     files: &'a [FileItem],
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
-    is_cancelled: Option<&AtomicBool>,
+    abort_signal: &AtomicBool,
     base_path: &Path,
-    arena: *const u8,
+    arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
     let total_files = files.len();
 
@@ -1925,9 +1946,10 @@ pub fn grep_search<'a>(
                 filtered_file_count,
                 case_insensitive,
                 budget,
-                is_cancelled,
+                abort_signal,
                 base_path,
                 arena,
+                overflow_arena,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, options.smart_case)
@@ -2125,10 +2147,11 @@ pub fn grep_search<'a>(
             filtered_file_count,
             budget,
             base_path,
-            arena: crate::simd_path::ArenaPtr::new(arena),
+            arena,
+            overflow_arena,
             prefilter: should_prefilter.then_some(&finder),
             prefilter_case_insensitive: case_insensitive,
-            is_cancelled,
+            abort_signal,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
@@ -2288,16 +2311,14 @@ mod tests {
 
     #[test]
     fn test_multi_grep_search() {
-        use crate::types::FileItem;
+        use crate::file_picker::{FilePicker, FilePickerOptions};
         use std::io::Write;
 
-        // Create temp files with known content
         let dir = tempfile::tempdir().unwrap();
 
         // File 1: has "GrepMode" and "GrepMatch"
-        let file1_path = dir.path().join("grep.rs");
         {
-            let mut f = std::fs::File::create(&file1_path).unwrap();
+            let mut f = std::fs::File::create(dir.path().join("grep.rs")).unwrap();
             writeln!(f, "pub enum GrepMode {{").unwrap();
             writeln!(f, "    PlainText,").unwrap();
             writeln!(f, "    Regex,").unwrap();
@@ -2308,46 +2329,31 @@ mod tests {
         }
 
         // File 2: has "PlainTextMatcher" only
-        let file2_path = dir.path().join("matcher.rs");
         {
-            let mut f = std::fs::File::create(&file2_path).unwrap();
+            let mut f = std::fs::File::create(dir.path().join("matcher.rs")).unwrap();
             writeln!(f, "struct PlainTextMatcher {{").unwrap();
             writeln!(f, "    needle: Vec<u8>,").unwrap();
             writeln!(f, "}}").unwrap();
         }
 
         // File 3: no matches
-        let file3_path = dir.path().join("other.rs");
         {
-            let mut f = std::fs::File::create(&file3_path).unwrap();
+            let mut f = std::fs::File::create(dir.path().join("other.rs")).unwrap();
             writeln!(f, "fn main() {{").unwrap();
             writeln!(f, "    println!(\"hello\");").unwrap();
             writeln!(f, "}}").unwrap();
         }
 
-        let meta1 = std::fs::metadata(&file1_path).unwrap();
-        let meta2 = std::fs::metadata(&file2_path).unwrap();
-        let meta3 = std::fs::metadata(&file3_path).unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: dir.path().to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
 
-        let paths = ["grep.rs", "matcher.rs", "other.rs"];
-        let sizes = [meta1.len(), meta2.len(), meta3.len()];
-        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
-        let raw_items: Vec<FileItem> = paths
-            .iter()
-            .zip(sizes.iter())
-            .map(|(p, &sz)| {
-                let fname = p.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-                FileItem::new_raw(fname, sz, 0, None, false)
-            })
-            .collect();
-        let (store, strings) =
-            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &raw_items);
-        let arena = store.arena_base_ptr();
-        let mut files: Vec<FileItem> = raw_items;
-        for (i, file) in files.iter_mut().enumerate() {
-            file.set_path(strings[i].clone());
-        }
-        std::mem::forget(store);
+        let files = picker.get_files();
+        let arena = picker.arena_base_ptr();
 
         let options = super::GrepSearchOptions {
             max_file_size: 10 * 1024 * 1024,
@@ -2361,30 +2367,31 @@ mod tests {
             after_context: 0,
             classify_definitions: false,
             trim_whitespace: false,
+            abort_signal: None,
         };
+        let no_cancel = AtomicBool::new(false);
 
         // Test with 3 patterns
         let result = super::multi_grep_search(
-            &files,
+            files,
             &["GrepMode", "GrepMatch", "PlainTextMatcher"],
             &[],
             &options,
-            &ContentCacheBudget::unlimited(),
+            picker.cache_budget(),
             None,
             None,
-            None,
+            &no_cancel,
             dir.path(),
+            arena,
             arena,
         );
 
-        // Should find matches from file1 (GrepMode, GrepMatch) and file2 (PlainTextMatcher)
         assert!(
             result.matches.len() >= 3,
             "Expected at least 3 matches, got {}",
             result.matches.len()
         );
 
-        // Verify all 3 patterns are found
         let has_grep_mode = result
             .matches
             .iter()
@@ -2402,20 +2409,20 @@ mod tests {
         assert!(has_grep_match, "Should find GrepMatch");
         assert!(has_plain_text_matcher, "Should find PlainTextMatcher");
 
-        // File 3 should have no matches
         assert_eq!(result.files.len(), 2, "Should match exactly 2 files");
 
         // Test with single pattern
         let result2 = super::multi_grep_search(
-            &files,
+            files,
             &["PlainTextMatcher"],
             &[],
             &options,
-            &ContentCacheBudget::unlimited(),
+            picker.cache_budget(),
             None,
             None,
-            None,
+            &no_cancel,
             dir.path(),
+            arena,
             arena,
         );
         assert_eq!(
@@ -2426,15 +2433,16 @@ mod tests {
 
         // Test with empty patterns
         let result3 = super::multi_grep_search(
-            &files,
+            files,
             &[],
             &[],
             &options,
-            &ContentCacheBudget::unlimited(),
+            picker.cache_budget(),
             None,
             None,
-            None,
+            &no_cancel,
             dir.path(),
+            arena,
             arena,
         );
         assert_eq!(

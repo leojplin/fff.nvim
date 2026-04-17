@@ -1,7 +1,19 @@
 /// Simple search profiler that directly uses scan_filesystem without background thread overhead
 use fff::file_picker::FilePicker;
-use fff::{FileItem, FuzzySearchOptions, PaginationArgs, QueryParser};
+use fff::{FuzzySearchOptions, PaginationArgs, QueryParser};
 use std::time::Instant;
+
+fn load_picker(path: &std::path::Path) -> FilePicker {
+    let mut picker = FilePicker::new(fff::FilePickerOptions {
+        base_path: path.to_string_lossy().to_string(),
+        warmup_mmap_cache: false,
+        mode: fff::FFFMode::Neovim,
+        ..Default::default()
+    })
+    .expect("Failed to create FilePicker");
+    picker.collect_files().expect("Failed to collect files");
+    picker
+}
 
 fn main() {
     let big_repo_path = std::path::PathBuf::from("./big-repo");
@@ -18,48 +30,11 @@ fn main() {
 
     eprintln!("Loading files from: {:?}", canonical_path);
 
-    // Directly scan without background thread
     let start = Instant::now();
-    let files = {
-        use ignore::WalkBuilder;
-        let mut files = Vec::new();
-        let mut rel_paths = Vec::new();
-
-        WalkBuilder::new(&canonical_path)
-            .hidden(false)
-            .build()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-            .for_each(|entry| {
-                let path = entry.path().to_path_buf();
-                let relative =
-                    pathdiff::diff_paths(&path, &canonical_path).unwrap_or_else(|| path.clone());
-                let relative_path = relative.to_string_lossy().into_owned();
-                let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-                files.push(FileItem::new_raw(
-                    filename_start,
-                    entry.metadata().ok().map_or(0, |m| m.len()),
-                    0,
-                    None,
-                    false,
-                ));
-                rel_paths.push(relative_path);
-            });
-
-        let (store, strings) =
-            fff::simd_path::build_chunked_path_store_from_strings(&rel_paths, &files);
-        let arena_base = store.arena_base_ptr();
-        for (i, file) in files.iter_mut().enumerate() {
-            file.set_path(strings[i].clone());
-        }
-        std::mem::forget(store);
-        (files, arena_base)
-    };
-
-    let (files, arena) = files;
+    let picker = load_picker(&canonical_path);
     eprintln!(
         "✓ Loaded {} files in {:.2}s\n",
-        files.len(),
+        picker.get_files().len(),
         start.elapsed().as_secs_f64()
     );
 
@@ -90,8 +65,7 @@ fn main() {
         for _ in 0..iterations {
             let parser = QueryParser::default();
             let parsed = parser.parse(query);
-            let results = FilePicker::fuzzy_search(
-                &files,
+            let results = picker.fuzzy_search(
                 &parsed,
                 None,
                 FuzzySearchOptions {
@@ -105,7 +79,6 @@ fn main() {
                         limit: 100,
                     },
                 },
-                arena,
             );
             match_count += results.total_matched;
         }

@@ -17,7 +17,7 @@
 //!     ├─> background scan thread ──> populates SharedPicker
 //!     └─> file-system watcher    ──> live updates SharedPicker
 //!
-//!   fuzzy_search()   <── static, borrows &[FileItem]
+//!   search()         <── borrows &self, delegates to fuzzy_search
 //!   grep()           <── static, borrows &[FileItem] (live content search)
 //!   trigger_rescan() <── synchronous re-index
 //!   cancel()         <── shuts down background work
@@ -35,7 +35,7 @@ use crate::bigram_filter::{BigramFilter, BigramIndexBuilder, BigramOverlay};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
-use crate::grep::{GrepResult, GrepSearchOptions, grep_search};
+use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::ignore::non_git_repo_overrides;
 use crate::query_tracker::QueryTracker;
 use crate::score::match_and_score_files;
@@ -90,7 +90,7 @@ impl FFFMode {
 
 /// Configuration for a single fuzzy search invocation.
 ///
-/// Passed to [`FilePicker::fuzzy_search`] to control threading, pagination,
+/// Passed to [`FilePicker::search`] to control threading, pagination,
 /// and scoring behavior.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FuzzySearchOptions<'a> {
@@ -118,10 +118,10 @@ struct FileSync {
     /// Built during `walk_filesystem` and used for directory picker mode,
     /// per-directory stats, and as a fast replacement for `extract_watch_dirs`.
     dirs: Vec<DirItem>,
-    /// Per-overflow-file path stores. Each overflow file's `ChunkedString` has
-    /// `arena_override` pointing into one of these. Dropped on rescan,
-    /// freeing the arenas.
-    overflow_stores: Vec<crate::simd_path::ChunkedPathStore>,
+    /// Shared builder for overflow file paths. Each overflow file's ChunkedString
+    /// uses `arena_override` pointing into this builder's arena. The builder
+    /// grows incrementally — no per-file store allocation. Dropped on rescan.
+    overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
     /// Compressed bigram inverted index built during the post-scan phase.
     /// Lives here so that replacing `FileSync` on rescan automatically drops
     /// the stale index (bigram file indices are positions in `files`).
@@ -140,7 +140,7 @@ impl FileSync {
             files: Vec::new(),
             base_count: 0,
             dirs: Vec::new(),
-            overflow_stores: Vec::new(),
+            overflow_builder: None,
             git_workdir: None,
             bigram_index: None,
             bigram_overlay: None,
@@ -148,14 +148,32 @@ impl FileSync {
         }
     }
 
-    /// Arena base pointer for resolving ChunkedString indices.
-    /// Returns null if the chunked path store hasn't been built yet.
+    /// Arena for base files (from the last full scan).
     #[inline]
-    fn arena_base_ptr(&self) -> *const u8 {
+    fn arena_base_ptr(&self) -> ArenaPtr {
         self.chunked_paths
             .as_ref()
-            .map(|s| s.arena_base_ptr())
-            .unwrap_or(std::ptr::null())
+            .map(|s| s.as_arena_ptr())
+            .unwrap_or(ArenaPtr::null())
+    }
+
+    /// Arena for overflow files (added after the last full scan).
+    #[inline]
+    fn overflow_arena_ptr(&self) -> ArenaPtr {
+        self.overflow_builder
+            .as_ref()
+            .map(|b| b.as_arena_ptr())
+            .unwrap_or(self.arena_base_ptr())
+    }
+
+    /// Resolve the correct arena for a given file (base vs overflow).
+    #[inline]
+    fn arena_for_file(&self, file: &FileItem) -> ArenaPtr {
+        if file.is_overflow() {
+            self.overflow_arena_ptr()
+        } else {
+            self.arena_base_ptr()
+        }
     }
 
     /// Get all files (base + overflow). The base portion `[..base_count]` is
@@ -178,29 +196,37 @@ impl FileSync {
     }
 
     /// Find file index by path using binary search on the sorted base portion.
+    /// `path` must be an absolute path under `base_path`.
     #[inline]
-    fn find_file_index(&self, path: &Path) -> Result<usize, usize> {
-        let path_str = path.as_os_str().to_string_lossy();
+    fn find_file_index(&self, path: &Path, base_path: &Path) -> Result<usize, usize> {
+        let arena = self.arena_base_ptr();
 
-        // Look up the directory index for the parent of this path
-        let parent_end = path_str.rfind('/').unwrap_or(path_str.len());
-        let parent_path = &path_str[..parent_end];
-        let filename = &path_str[parent_end.saturating_add(1)..];
+        // Strip base_path prefix to get the relative path.
+        let rel_path = match path.strip_prefix(base_path) {
+            Ok(r) => r.to_string_lossy(),
+            Err(_) => return Err(0),
+        };
 
-        // Binary search dirs to find the parent directory index
+        // Split into directory (with trailing '/') and filename.
+        let parent_end = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let dir_rel = &rel_path[..parent_end];
+        let filename = &rel_path[parent_end..];
+
+        // Binary search dirs to find the parent directory index.
+        // Dir items store the relative path including trailing '/' (e.g. "src/components/").
+        let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let dir_idx = match self
             .dirs
-            .binary_search_by(|d| d.path_str().cmp(parent_path))
+            .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
         {
             Ok(idx) => idx as u32,
             Err(_) => return Err(0), // directory not found
         };
 
         // Binary search files by (parent_dir, filename) — same order as the sort
-        let arena = self.arena_base_ptr();
         self.files[..self.base_count].binary_search_by(|f| {
             f.parent_dir_index().cmp(&dir_idx).then_with(|| {
-                let fname = f.file_name(arena);
+                let fname = f.file_name_from_arena(arena);
                 fname.as_str().cmp(filename)
             })
         })
@@ -209,10 +235,10 @@ impl FileSync {
     /// Find a file in the overflow portion by relative path (linear scan).
     /// Returns the absolute index into `files` (i.e. `base_count + position`).
     fn find_overflow_index(&self, rel_path: &str) -> Option<usize> {
-        let arena = self.arena_base_ptr();
+        let overflow_arena = self.overflow_arena_ptr();
         self.files[self.base_count..]
             .iter()
-            .position(|f| f.relative_path_eq(arena, rel_path))
+            .position(|f| f.relative_path_eq(overflow_arena, rel_path))
             .map(|pos| self.base_count + pos)
     }
 
@@ -243,7 +269,7 @@ impl FileSync {
     fn insert_file_sorted(&mut self, file: FileItem, base_path: &Path) -> bool {
         let arena = self.arena_base_ptr();
         let abs_path = file.absolute_path(arena, base_path);
-        match self.find_file_index(&abs_path) {
+        match self.find_file_index(&abs_path, base_path) {
             Ok(_) => false, // File already exists
             Err(position) => {
                 self.insert_file(position, file);
@@ -262,7 +288,7 @@ impl FileItem {
     /// Create a FileItem using pre-fetched metadata to avoid a redundant stat syscall.
     /// Returns `(FileItem, relative_path)`. The FileItem's `path` field is
     /// empty; callers must populate it via `set_path` or `build_chunked_path_store_and_assign`.
-    pub fn new_with_metadata(
+    fn new_with_metadata(
         path: PathBuf,
         base_path: &Path,
         git_status: Option<Status>,
@@ -329,10 +355,10 @@ impl FileItem {
         (item, rel_str)
     }
 
-    pub fn update_frecency_scores(
+    pub(crate) fn update_frecency_scores(
         &mut self,
         tracker: &FrecencyTracker,
-        arena: *const u8,
+        arena: ArenaPtr,
         base_path: &Path,
         mode: FFFMode,
     ) -> Result<(), Error> {
@@ -414,11 +440,45 @@ impl FilePicker {
         &self.base_path
     }
 
-    /// Arena base pointer for resolving ChunkedString indices on files.
-    /// Returns null if the chunked path store hasn't been built yet.
     #[inline]
-    pub fn arena_base_ptr(&self) -> *const u8 {
+    pub(crate) fn arena_base_ptr(&self) -> ArenaPtr {
         self.sync_data.arena_base_ptr()
+    }
+
+    /// File name (e.g. `Button.tsx`) from the arena.
+    #[inline]
+    pub fn file_name(&self, file: &FileItem) -> String {
+        file.file_name_from_arena(self.sync_data.arena_for_file(file))
+    }
+
+    /// Relative path (e.g. `src/components/Button.tsx`) from the arena.
+    #[inline]
+    pub fn relative_path(&self, file: &FileItem) -> String {
+        file.relative_path_from_arena(self.sync_data.arena_for_file(file))
+    }
+
+    /// Directory portion of the path (e.g. `src/components/`).
+    #[inline]
+    pub fn dir_str(&self, file: &FileItem) -> String {
+        file.dir_str(self.sync_data.arena_for_file(file))
+    }
+
+    /// Absolute path on disk.
+    #[inline]
+    pub fn absolute_path(&self, file: &FileItem) -> PathBuf {
+        file.absolute_path(self.sync_data.arena_for_file(file), &self.base_path)
+    }
+
+    /// Relative path of a directory entry.
+    #[inline]
+    pub fn dir_relative_path(&self, dir: &DirItem) -> String {
+        dir.relative_path(self.sync_data.arena_base_ptr())
+    }
+
+    /// Absolute path of a directory entry.
+    #[inline]
+    pub fn dir_absolute_path(&self, dir: &DirItem) -> PathBuf {
+        dir.absolute_path(self.sync_data.arena_base_ptr(), &self.base_path)
     }
 
     /// Convert an absolute path to a relative path string (relative to base_path).
@@ -502,11 +562,12 @@ impl FilePicker {
             // We also need ancestor directories (parents of parents) for the
             // watcher to work. Walk up from each dir to the base.
             let base = self.base_path.as_path();
+            let arena = self.arena_base_ptr();
             let mut all_dirs = Vec::with_capacity(dir_table.len() * 2);
             let mut seen = std::collections::HashSet::with_capacity(dir_table.len() * 2);
 
             for dir_item in dir_table {
-                let mut current = dir_item.as_path().to_path_buf();
+                let mut current = dir_item.absolute_path(arena, base);
                 while current.as_path() != base {
                     if !seen.insert(current.clone()) {
                         break; // already visited this and all its ancestors
@@ -714,13 +775,13 @@ impl FilePicker {
     /// automatically look up the last selected file for this query and apply
     /// combo-boost scoring.
     ///
-    pub fn fuzzy_search<'a, 'q>(
-        files: &'a [FileItem],
+    pub fn fuzzy_search<'q>(
+        &self,
         query: &'q FFFQuery<'q>,
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
-        arena_base: *const u8,
-    ) -> SearchResult<'a> {
+    ) -> SearchResult<'_> {
+        let files = self.get_files();
         let max_threads = if options.max_threads == 0 {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -777,7 +838,22 @@ impl FilePicker {
         };
 
         let time = std::time::Instant::now();
-        let (items, scores, total_matched) = match_and_score_files(files, &context, arena_base);
+
+        let base_arena = self.sync_data.arena_base_ptr();
+        let overflow_arena = self
+            .sync_data
+            .overflow_builder
+            .as_ref()
+            .map(|b| b.as_arena_ptr())
+            .unwrap_or(base_arena);
+
+        let (items, scores, total_matched) = match_and_score_files(
+            files,
+            &context,
+            self.sync_data.base_count,
+            base_arena,
+            overflow_arena,
+        );
 
         info!(
             ?query,
@@ -797,9 +873,15 @@ impl FilePicker {
         }
     }
 
-    /// Perform a live grep search across indexed files with a pre-parsed query.
+    /// Perform a live grep search across indexed files.
+    ///
+    /// If `options.abort_signal` is set it overrides the picker's internal
+    /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
+        let arena = self.arena_base_ptr();
+        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let cancel = options.abort_signal.as_deref().unwrap_or(&self.cancelled);
 
         grep_search(
             self.get_files(),
@@ -808,19 +890,50 @@ impl FilePicker {
             self.cache_budget(),
             self.sync_data.bigram_index.as_deref(),
             overlay_guard.as_deref(),
-            Some(&self.cancelled),
+            cancel,
             &self.base_path,
-            self.arena_base_ptr(),
+            arena,
+            overflow_arena,
+        )
+    }
+
+    /// Multi-pattern grep search across indexed files.
+    pub fn multi_grep(
+        &self,
+        patterns: &[&str],
+        constraints: &[fff_query_parser::Constraint<'_>],
+        options: &GrepSearchOptions,
+    ) -> GrepResult<'_> {
+        let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
+        let arena = self.arena_base_ptr();
+        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let cancel = options.abort_signal.as_deref().unwrap_or(&self.cancelled);
+
+        multi_grep_search(
+            self.get_files(),
+            patterns,
+            constraints,
+            options,
+            self.cache_budget(),
+            self.sync_data.bigram_index.as_deref(),
+            overlay_guard.as_deref(),
+            cancel,
+            &self.base_path,
+            arena,
+            overflow_arena,
         )
     }
 
     /// Like [`grep`](Self::grep) but ignores the bigram overlay.
-    /// Useful for testing that the overlay is actually contributing results.
     pub fn grep_without_overlay(
         &self,
         query: &FFFQuery<'_>,
         options: &GrepSearchOptions,
     ) -> GrepResult<'_> {
+        let arena = self.arena_base_ptr();
+        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let cancel = options.abort_signal.as_deref().unwrap_or(&self.cancelled);
+
         grep_search(
             self.get_files(),
             query,
@@ -828,9 +941,10 @@ impl FilePicker {
             self.cache_budget(),
             self.sync_data.bigram_index.as_deref(),
             None,
-            Some(&self.cancelled),
+            cancel,
             &self.base_path,
-            self.arena_base_ptr(),
+            arena,
+            overflow_arena,
         )
     }
 
@@ -888,7 +1002,7 @@ impl FilePicker {
         let rel = self.to_relative_path(path).unwrap_or("");
         let index = self
             .sync_data
-            .find_file_index(path)
+            .find_file_index(path, &self.base_path)
             .ok()
             .or_else(|| self.sync_data.find_overflow_index(rel));
         if let Some(index) = index
@@ -902,7 +1016,7 @@ impl FilePicker {
 
     pub fn get_file_by_path(&self, path: impl AsRef<Path>) -> Option<&FileItem> {
         self.sync_data
-            .find_file_index(path.as_ref())
+            .find_file_index(path.as_ref(), &self.base_path)
             .ok()
             .and_then(|index| self.sync_data.files().get(index))
     }
@@ -912,7 +1026,7 @@ impl FilePicker {
         let rel = self.to_relative_path(path).unwrap_or("");
         let index = self
             .sync_data
-            .find_file_index(path)
+            .find_file_index(path, &self.base_path)
             .ok()
             .or_else(|| self.sync_data.find_overflow_index(rel));
         index.and_then(|i| self.sync_data.get_file_mut(i))
@@ -926,7 +1040,7 @@ impl FilePicker {
         if self.sync_data.insert_file_sorted(file, &self.base_path) {
             // File was inserted, look it up
             self.sync_data
-                .find_file_index(&path)
+                .find_file_index(&path, &self.base_path)
                 .ok()
                 .and_then(|idx| self.sync_data.get_file_mut(idx))
                 .map(|file_mut| &*file_mut) // Convert &mut to &
@@ -937,7 +1051,7 @@ impl FilePicker {
                 path.display()
             );
             self.sync_data
-                .find_file_index(&path)
+                .find_file_index(&path, &self.base_path)
                 .ok()
                 .and_then(|idx| self.sync_data.get_file_mut(idx))
                 .map(|file_mut| &*file_mut) // Convert &mut to &
@@ -949,7 +1063,7 @@ impl FilePicker {
         let path = path.as_ref();
         let overlay = self.sync_data.bigram_overlay.as_ref().map(Arc::clone);
 
-        if let Ok(pos) = self.sync_data.find_file_index(path) {
+        if let Ok(pos) = self.sync_data.find_file_index(path, &self.base_path) {
             let file = self.sync_data.get_file_mut(pos)?;
 
             if file.is_deleted() {
@@ -1022,16 +1136,15 @@ impl FilePicker {
 
         let (mut file_item, rel_path) = FileItem::new(path.to_path_buf(), &self.base_path, None);
 
-        let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
-            std::slice::from_ref(&rel_path),
-            std::slice::from_ref(&file_item),
-        );
+        // Lazily create the shared overflow builder on first use.
+        let builder = self
+            .sync_data
+            .overflow_builder
+            .get_or_insert_with(|| crate::simd_path::ChunkedPathStoreBuilder::new(64));
 
-        let mut cs = strings.into_iter().next().unwrap();
-        cs.set_arena_override(store.arena_base_ptr());
+        let cs = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
         file_item.set_path(cs);
-
-        self.sync_data.overflow_stores.push(store);
+        file_item.set_overflow(true);
         self.sync_data.files.push(file_item);
         self.sync_data.files.last()
     }
@@ -1039,7 +1152,7 @@ impl FilePicker {
     /// Tombstone a file instead of removing it, keeping base indices stable.
     pub fn remove_file_by_path(&mut self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
-        match self.sync_data.find_file_index(path) {
+        match self.sync_data.find_file_index(path, &self.base_path) {
             Ok(index) => {
                 let file = &mut self.sync_data.files[index];
                 file.set_deleted(true);
@@ -1129,18 +1242,23 @@ impl FilePicker {
                         let budget = Arc::clone(&picker.cache_budget);
                         let static_files: &[FileItem] =
                             unsafe { std::slice::from_raw_parts(ptr, len) };
-                        (static_files, budget)
+                        (
+                            static_files,
+                            budget,
+                            picker.base_path().to_path_buf(),
+                            picker.arena_base_ptr(),
+                        )
                     })
                 })
             } else {
                 None
             };
 
-            if let Some((files, budget)) = files_snapshot {
+            if let Some((files, budget, bp, arena)) = files_snapshot {
                 // Warmup mmap caches.
                 if !cancelled.load(Ordering::Acquire) {
                     let t = std::time::Instant::now();
-                    warmup_mmaps(files, &budget);
+                    warmup_mmaps(files, &budget, &bp, arena);
                     info!(
                         "Rescan warmup completed in {:.2}s (cached {} files, {} bytes)",
                         t.elapsed().as_secs_f64(),
@@ -1156,7 +1274,7 @@ impl FilePicker {
                         "Rescan: starting bigram index build for {} files...",
                         files.len()
                     );
-                    let (index, content_binary) = build_bigram_index(files, &budget);
+                    let (index, content_binary) = build_bigram_index(files, &budget, &bp, arena);
                     info!(
                         "Rescan: bigram index ready in {:.2}s",
                         t.elapsed().as_secs_f64()
@@ -1231,14 +1349,13 @@ impl FilePicker {
                     let frecency_ref = frecency.as_ref().and_then(|f| f.as_ref());
                     let mode = self.mode;
                     let bp = &self.base_path;
-                    let arena = ArenaPtr::new(self.arena_base_ptr());
+                    let arena = self.arena_base_ptr();
                     BACKGROUND_THREAD_POOL.install(|| {
                         self.sync_data.files.par_iter_mut().for_each(|file| {
                             file.git_status =
-                                git_cache.lookup_status(&file.absolute_path(arena.as_ptr(), bp));
+                                git_cache.lookup_status(&file.absolute_path(arena, bp));
                             if let Some(frecency) = frecency_ref {
-                                let _ =
-                                    file.update_frecency_scores(frecency, arena.as_ptr(), bp, mode);
+                                let _ = file.update_frecency_scores(frecency, arena, bp, mode);
                             }
                         });
                     });
@@ -1277,12 +1394,9 @@ impl FilePicker {
 ///
 /// Returned by [`FilePicker::get_scan_progress`]. Useful for displaying
 /// a progress indicator while the initial scan is running.
-#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
-    /// Number of files indexed so far.
     pub scanned_files_count: usize,
-    /// `true` while the background scan thread is still running.
     pub is_scanning: bool,
     pub is_watcher_ready: bool,
     pub is_warmup_complete: bool,
@@ -1419,7 +1533,7 @@ fn spawn_scan_and_watcher(
             // completing and the warmup + bigram phase finishing because
             // `post_scan_busy` prevents concurrent rescans from replacing
             // sync_data while we hold the raw pointer.
-            let files_snapshot: Option<(&[FileItem], Arc<ContentCacheBudget>, *const u8)> =
+            let files_snapshot: Option<(&[FileItem], Arc<ContentCacheBudget>, ArenaPtr)> =
                 if !cancelled.load(Ordering::Acquire) {
                     let guard = shared_picker.read().ok();
                     guard.and_then(|guard| {
@@ -1506,11 +1620,11 @@ fn spawn_scan_and_watcher(
 /// Files beyond the budget are still available via temporary mmaps on first
 /// grep access, so correctness is unaffected.
 #[tracing::instrument(skip(files), name = "warmup_mmaps", level = Level::DEBUG)]
-pub fn warmup_mmaps(
+pub(crate) fn warmup_mmaps(
     files: &[FileItem],
     budget: &ContentCacheBudget,
     base_path: &Path,
-    arena: *const u8,
+    arena: ArenaPtr,
 ) {
     let max_files = budget.max_files;
     let max_bytes = budget.max_bytes;
@@ -1540,7 +1654,6 @@ pub fn warmup_mmaps(
 
     let warmed_bytes = AtomicU64::new(0);
     let budget_exhausted = AtomicBool::new(false);
-    let arena = ArenaPtr::new(arena);
 
     BACKGROUND_THREAD_POOL.install(|| {
         to_warm.par_iter().for_each(|file| {
@@ -1559,7 +1672,7 @@ pub fn warmup_mmaps(
                 return;
             }
 
-            if let Some(content) = file.get_content(arena.as_ptr(), base_path, budget) {
+            if let Some(content) = file.get_content(arena, base_path, budget) {
                 let _ = std::hint::black_box(content.first());
             }
         });
@@ -1571,11 +1684,11 @@ pub fn warmup_mmaps(
 /// so reading further adds no new information to the index.
 pub const BIGRAM_CONTENT_CAP: usize = 64 * 1024;
 
-pub fn build_bigram_index(
+pub(crate) fn build_bigram_index(
     files: &[FileItem],
     budget: &ContentCacheBudget,
     base_path: &Path,
-    arena: *const u8,
+    arena: ArenaPtr,
 ) -> (BigramFilter, Vec<usize>) {
     let start = std::time::Instant::now();
     info!("Building bigram index for {} files...", files.len());
@@ -1587,7 +1700,6 @@ pub fn build_bigram_index(
     // actually binary (contain NUL bytes). These are marked `is_binary = true`
     // on the real file list after the build, so grep never has to re-check.
     let content_binary: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-    let arena = ArenaPtr::new(arena);
 
     BACKGROUND_THREAD_POOL.install(|| {
         files.par_iter().enumerate().for_each(|(i, file)| {
@@ -1598,16 +1710,14 @@ pub fn build_bigram_index(
             // For uncached files, read from disk — heap memory is freed on drop.
             let data: Option<&[u8]>;
             let owned;
-            if let Some(cached) = file.get_content(arena.as_ptr(), base_path, budget) {
+            if let Some(cached) = file.get_content(arena, base_path, budget) {
                 if detect_binary_content(cached) {
                     content_binary.lock().unwrap().push(i);
                     return;
                 }
                 data = Some(cached);
                 owned = None;
-            } else if let Ok(read_data) =
-                std::fs::read(file.absolute_path(arena.as_ptr(), base_path))
-            {
+            } else if let Ok(read_data) = std::fs::read(file.absolute_path(arena, base_path)) {
                 if detect_binary_content(&read_data) {
                     content_binary.lock().unwrap().push(i);
                     return;
@@ -1658,162 +1768,11 @@ pub fn build_bigram_index(
     (index, binary_indices)
 }
 
-// pub for benchmarks
-/// Returns `(files, arena_base_ptr)`. The arena is leaked so the pointer
-/// remains valid for the process lifetime.
-pub fn scan_files(base_path: &Path) -> (Vec<FileItem>, *const u8) {
-    use ignore::{WalkBuilder, WalkState};
-
-    let git_workdir = Repository::discover(base_path)
-        .ok()
-        .and_then(|repo| repo.workdir().map(Path::to_path_buf));
-    let is_git_repo = git_workdir.is_some();
-
-    let mut walk_builder = WalkBuilder::new(base_path);
-    walk_builder
-        .hidden(!is_git_repo)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
-        .ignore(true)
-        .follow_links(false);
-
-    if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
-        walk_builder.overrides(overrides);
-    }
-
-    let walker = walk_builder.build_parallel();
-    let files = parking_lot::Mutex::new(Vec::new());
-
-    walker.run(|| {
-        let files = &files;
-        let base_path = base_path.to_path_buf();
-
-        Box::new(move |result| {
-            let Ok(entry) = result else {
-                return WalkState::Continue;
-            };
-
-            if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                let path = entry.path();
-
-                if is_git_file(path) {
-                    return WalkState::Continue;
-                }
-
-                if !is_git_repo && is_known_binary_extension(path) {
-                    return WalkState::Continue;
-                }
-
-                let metadata = entry.metadata().ok();
-                let file_item = FileItem::new_with_metadata(
-                    path.to_path_buf(),
-                    &base_path,
-                    None,
-                    metadata.as_ref(),
-                );
-
-                files.lock().push(file_item);
-            }
-            WalkState::Continue
-        })
-    });
-
-    let pairs = files.into_inner();
-
-    // Build ChunkedPathStore incrementally — each path is chunked inline,
-    // then the String is dropped. No Vec<String> needed.
-    let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-    let mut files: Vec<FileItem> = Vec::with_capacity(pairs.len());
-    let mut chunked_strings: Vec<crate::simd_path::ChunkedString> = Vec::with_capacity(pairs.len());
-    for (file, rel_path) in pairs {
-        let fname_offset = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-        chunked_strings.push(builder.add_file_immediate(&rel_path, fname_offset));
-        files.push(file);
-        // rel_path String dropped here — bytes already in arena
-    }
-    let store = builder.finish();
-    let arena = store.arena_base_ptr();
-    for (file, cs) in files.iter_mut().zip(chunked_strings) {
-        file.set_path(cs);
-    }
-    // Store must be leaked so ChunkedString arena pointers remain valid.
-    std::mem::forget(store);
-
-    // file_name() returns an owned String, so sort_unstable_by_key doesn't help
-    #[allow(clippy::unnecessary_sort_by)]
-    files.sort_unstable_by(|a, b| a.file_name(arena).cmp(&b.file_name(arena)));
-    (files, arena)
-}
-
 /// Result of the fast walk phase — files are searchable immediately,
 /// git status arrives later via the join handle.
 struct WalkResult {
     sync: FileSync,
     git_handle: std::thread::JoinHandle<Option<GitStatusCache>>,
-}
-
-/// Like `assign_parent_dirs_from_paths`, but reads dir portions directly from
-/// each file's `ChunkedString` — no separate `Vec<String>` needed.
-fn assign_parent_dirs_from_chunked(
-    files: &mut [FileItem],
-    base_path: &Path,
-    arena: *const u8,
-) -> Vec<DirItem> {
-    let base_str = base_path.as_os_str().to_string_lossy();
-    let base_len = base_str.len();
-
-    let mut dir_map: ahash::AHashMap<String, u32> = ahash::AHashMap::new();
-    let mut dir_entries: Vec<(String, u16)> = Vec::new();
-
-    // First pass: discover unique directories
-    let mut buf = [0u8; 512];
-    for file in files.iter() {
-        let rel = file.path.read_to_buf(arena, &mut buf);
-        let abs_path = if rel.is_empty() {
-            base_str.to_string()
-        } else {
-            format!("{}/{}", base_str, rel)
-        };
-        let parent_end = abs_path.rfind('/').unwrap_or(base_len);
-        let parent = &abs_path[..parent_end];
-
-        if !dir_map.contains_key(parent) {
-            let relative_start = if parent_end > base_len {
-                (base_len + 1) as u16
-            } else {
-                parent_end as u16
-            };
-            dir_map.insert(parent.to_string(), dir_entries.len() as u32);
-            dir_entries.push((parent.to_string(), relative_start));
-        }
-    }
-
-    dir_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-    let sorted_map: ahash::AHashMap<&str, u32> = dir_entries
-        .iter()
-        .enumerate()
-        .map(|(i, (path, _))| (path.as_str(), i as u32))
-        .collect();
-
-    // Second pass: assign parent_dir index to each file
-    for file in files.iter_mut() {
-        let rel = file.path.read_to_buf(arena, &mut buf);
-        let abs_path = if rel.is_empty() {
-            base_str.to_string()
-        } else {
-            format!("{}/{}", base_str, rel)
-        };
-        let parent_end = abs_path.rfind('/').unwrap_or(base_len);
-        let parent = &abs_path[..parent_end];
-        file.set_parent_dir(*sorted_map.get(parent).unwrap());
-    }
-
-    dir_entries
-        .into_iter()
-        .map(|(path, relative_start)| DirItem::new(path, relative_start))
-        .collect()
 }
 
 /// Returns files immediately (searchable) and a handle to the in-progress
@@ -1926,35 +1885,49 @@ fn walk_filesystem(
         pairs.par_sort_unstable_by(|(_, a), (_, b)| a.cmp(b));
     });
 
-    // Build ChunkedPathStore + assign ChunkedStrings in one pass.
+    // Build ChunkedPathStore + extract dirs + assign parent_dir in one pass.
+    // Files are sorted by relative path, so dir changes happen in order.
     // add_file_immediate returns a ChunkedString with null arena_base;
     // we fixup arena_base after the arena is frozen.
     let mut files: Vec<FileItem> = Vec::with_capacity(pairs.len());
+    let mut dirs: Vec<DirItem> = Vec::new();
     let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
+    // Use a sentinel that can never match any real dir_part (including "")
+    // so the very first file always creates its dir entry.
+    let mut prev_dir: Option<String> = None;
+    let mut current_dir_idx: u32 = 0;
+
     for (mut file, rel) in pairs {
+        let fname_offset = file.path.filename_offset as usize;
+        let dir_part = &rel[..fname_offset];
+
+        if prev_dir.as_deref() != Some(dir_part) {
+            let dir_cs = builder.add_dir_immediate(dir_part);
+            dirs.push(DirItem::new(dir_cs));
+            current_dir_idx = (dirs.len() - 1) as u32;
+            prev_dir = Some(dir_part.to_string());
+        }
+
         let cs = builder.add_file_immediate(&rel, file.path.filename_offset);
         file.set_path(cs);
+        file.set_parent_dir(current_dir_idx);
         files.push(file);
     }
     let chunked_paths = builder.finish();
-    let arena_base = chunked_paths.arena_base_ptr();
+    let arena = chunked_paths.as_arena_ptr();
 
     // Apply frecency scores (access-based only — git status not yet available).
     let frecency = shared_frecency
         .read()
         .map_err(|_| Error::AcquireFrecencyLock)?;
-    let arena_ptr = ArenaPtr::new(arena_base);
     if let Some(frecency) = frecency.as_ref() {
         BACKGROUND_THREAD_POOL.install(|| {
             files.par_iter_mut().for_each(|file| {
-                let _ = file.update_frecency_scores(frecency, arena_ptr.as_ptr(), base_path, mode);
+                let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
             });
         });
     }
     drop(frecency);
-
-    // Extract dirs and assign parent_dir. Files have ChunkedStrings now.
-    let dirs = assign_parent_dirs_from_chunked(&mut files, base_path, arena_base);
 
     // Re-sort by (parent_dir, filename) for binary search in find_file_index.
     BACKGROUND_THREAD_POOL.install(|| {
@@ -1962,8 +1935,8 @@ fn walk_filesystem(
             a.parent_dir_index()
                 .cmp(&b.parent_dir_index())
                 .then_with(|| {
-                    a.file_name(arena_ptr.as_ptr())
-                        .cmp(&b.file_name(arena_ptr.as_ptr()))
+                    a.file_name_from_arena(arena)
+                        .cmp(&b.file_name_from_arena(arena))
                 })
         });
     });
@@ -1974,7 +1947,10 @@ fn walk_filesystem(
     let file_item_size = std::mem::size_of::<FileItem>();
     let files_vec_bytes = files.len() * file_item_size;
     let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
-        + dirs.iter().map(|d| d.path_str().len()).sum::<usize>();
+        + dirs
+            .iter()
+            .map(|d| d.relative_path(arena).len())
+            .sum::<usize>();
 
     let total_time = scan_start.elapsed();
     info!(
@@ -1996,7 +1972,7 @@ fn walk_filesystem(
             files,
             base_count,
             dirs,
-            overflow_stores: Vec::new(),
+            overflow_builder: None,
             git_workdir,
             bigram_index: None,
             bigram_overlay: None,
@@ -2006,8 +1982,6 @@ fn walk_filesystem(
     })
 }
 
-/// Phase 2: apply git status to already-indexed files and recalculate
-/// frecency scores that depend on it.
 fn apply_git_status(
     shared_picker: &SharedPicker,
     shared_frecency: &SharedFrecency,
@@ -2034,13 +2008,14 @@ fn apply_git_status(
 
         BACKGROUND_THREAD_POOL.install(|| {
             let bp = &picker.base_path;
-            let arena = ArenaPtr::new(picker.arena_base_ptr());
+            let arena = picker.arena_base_ptr();
             picker.sync_data.files.par_iter_mut().for_each(|file| {
                 let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                let abs = file.write_absolute_path(arena.as_ptr(), bp, &mut abs_buf);
+                let abs = file.write_absolute_path(arena, bp, &mut abs_buf);
+
                 file.git_status = git_cache.lookup_status(abs);
                 if let Some(frecency) = frecency_ref {
-                    let _ = file.update_frecency_scores(frecency, arena.as_ptr(), bp, mode);
+                    let _ = file.update_frecency_scores(frecency, arena, bp, mode);
                 }
             });
         });

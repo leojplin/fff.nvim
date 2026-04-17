@@ -3,9 +3,9 @@
 /// Usage:
 ///   cargo build --release --bin bench_grep_query
 ///   ./target/release/bench_grep_query --path ~/dev/chromium --query "MAX_FILE_SIZE" --iters 3
-///   ./target/release/bench_grep_query --path ~/dev/chromium --query "TODO" --no-bigram
-use fff::grep::{GrepMode, GrepSearchOptions, grep_search, parse_grep_query};
-use fff::types::ContentCacheBudget;
+///   ./target/release/bench_grep_query --path ~/dev/chromium --query "TODO"
+use fff::file_picker::FilePicker;
+use fff::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 use std::time::Instant;
 
 fn fmt_dur(us: u128) -> String {
@@ -14,18 +14,11 @@ fn fmt_dur(us: u128) -> String {
     } else if us > 1000 {
         format!("{:.2}ms", us as f64 / 1000.0)
     } else {
-        format!("{}µs", us)
+        format!("{}us", us)
     }
 }
 
-fn run_grep(
-    files: &[fff::FileItem],
-    index: Option<&fff::BigramFilter>,
-    query: &str,
-    iters: usize,
-    base_path: &std::path::Path,
-    arena: *const u8,
-) {
+fn run_grep(picker: &FilePicker, query: &str, iters: usize) {
     let options = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         max_matches_per_file: 200,
@@ -38,17 +31,15 @@ fn run_grep(
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: false,
+        abort_signal: None,
     };
 
     let parsed = parse_grep_query(query);
-    let budget = ContentCacheBudget::default();
     let mut times_us = Vec::with_capacity(iters);
 
     for i in 0..iters {
         let t = Instant::now();
-        let result = grep_search(
-            files, &parsed, &options, &budget, index, None, None, base_path, arena,
-        );
+        let result = picker.grep(&parsed, &options);
         let us = t.elapsed().as_micros();
         times_us.push(us);
 
@@ -80,21 +71,6 @@ fn run_grep(
     }
 }
 
-fn build_bigram(
-    files: &mut [fff::FileItem],
-    base_path: &std::path::Path,
-    arena: *const u8,
-) -> fff::BigramFilter {
-    let budget = ContentCacheBudget::default();
-    let (index, binary_indices) = fff::build_bigram_index(files, &budget, base_path, arena);
-
-    for &i in &binary_indices {
-        files[i].set_binary(true);
-    }
-
-    index
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -119,12 +95,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
-    let no_bigram = args.iter().any(|a| a == "--no-bigram");
-
     let repo = std::path::PathBuf::from(path);
     if !repo.exists() {
         eprintln!("Path not found: {}", path);
-        eprintln!("Usage: bench_grep_query --path <dir> --query <text> [--iters N] [--no-bigram]");
+        eprintln!("Usage: bench_grep_query --path <dir> --query <text> [--iters N]");
         std::process::exit(1);
     }
 
@@ -136,9 +110,17 @@ fn main() {
     eprintln!();
 
     // ── 1. Scan files ──────────────────────────────────────────────────
-    eprint!("[1/3] Scanning files... ");
+    eprint!("[1/2] Scanning files... ");
     let t = Instant::now();
-    let (mut files, arena) = fff::scan_files(&canonical);
+    let mut picker = FilePicker::new(fff::FilePickerOptions {
+        base_path: canonical.to_string_lossy().to_string(),
+        warmup_mmap_cache: false,
+        mode: fff::FFFMode::Neovim,
+        ..Default::default()
+    })
+    .expect("Failed to create FilePicker");
+    picker.collect_files().expect("Failed to collect files");
+    let files = picker.get_files();
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     eprintln!(
         "{} files in {:.2}s ({} non-binary)",
@@ -147,31 +129,10 @@ fn main() {
         non_binary,
     );
 
-    if no_bigram {
-        eprintln!("[2/3] Bigram index skipped (--no-bigram)");
-        eprintln!(
-            "\n[3/3] Running grep \"{}\" x {} iterations\n",
-            query, iters
-        );
-        run_grep(&files, None, query, iters, &repo, arena);
-        return;
-    }
-
-    // ── 2. Build bigram index ──────────────────────────────────────────
-    eprint!("[2/3] Bigram index... ");
-    let t = Instant::now();
-    let index = build_bigram(&mut files, &repo, arena);
+    // ── 2. Grep ───────────────────────────────────────────────────────
     eprintln!(
-        "done in {:.2}s  ({} cols, {:.1} MB)",
-        t.elapsed().as_secs_f64(),
-        index.columns_used(),
-        index.heap_bytes() as f64 / (1024.0 * 1024.0),
-    );
-
-    // ── 3. Grep ───────────────────────────────────────────────────────
-    eprintln!(
-        "\n[3/3] Running grep \"{}\" x {} iterations\n",
+        "\n[2/2] Running grep \"{}\" x {} iterations\n",
         query, iters
     );
-    run_grep(&files, Some(&index), query, iters, &repo, arena);
+    run_grep(&picker, query, iters);
 }

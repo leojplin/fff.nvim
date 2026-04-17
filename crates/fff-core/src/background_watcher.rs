@@ -621,7 +621,7 @@ fn is_git_file(path: &Path) -> bool {
         .any(|component| component.as_os_str() == ".git")
 }
 
-pub fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) -> bool {
+fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) -> bool {
     let Some(repo) = repo.as_ref() else {
         return false;
     };

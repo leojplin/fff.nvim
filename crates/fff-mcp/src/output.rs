@@ -1,16 +1,13 @@
 //! Output formatting for MCP grep/search results.
-//!
-//! Port of `packages/fff-mcp/src/output.ts` — token-efficient formatting
-//! with definition auto-expansion, frecency/git annotations, and Read suggestions.
 
 use fff::GrepMatch;
+use fff::file_picker::FilePicker;
 use fff::git::format_git_status_opt;
 use fff::grep::is_import_line;
 use fff::types::FileItem;
 
 use crate::cursor::CursorStore;
 
-/// Frecency score → single-token word. `None` for low-scoring files.
 fn frecency_word(score: i32) -> Option<&'static str> {
     if score >= 100 {
         Some("hot")
@@ -23,7 +20,6 @@ fn frecency_word(score: i32) -> Option<&'static str> {
     }
 }
 
-/// Build " - hot git:modified" style suffix. Empty when nothing to report.
 pub fn file_suffix(git_status: Option<git2::Status>, frecency_score: i32) -> String {
     match (
         frecency_word(frecency_score),
@@ -57,7 +53,6 @@ impl OutputMode {
 
 const LARGE_FILE_BYTES: u64 = 20_000;
 
-/// Tag for large files — nudges model to use offset/limit when reading.
 fn size_tag(bytes: u64) -> String {
     if bytes < LARGE_FILE_BYTES {
         String::new()
@@ -69,11 +64,8 @@ fn size_tag(bytes: u64) -> String {
 
 const MAX_PREVIEW: usize = 120;
 const MAX_LINE_LEN: usize = 180;
-/// Max context lines to show when auto-expanding the first definition
 const MAX_DEF_EXPAND_FIRST: usize = 8;
-/// Max context lines for subsequent definitions
 const MAX_DEF_EXPAND: usize = 5;
-/// Max context lines for non-definition first match in small result sets
 const MAX_FIRST_MATCH_EXPAND: usize = 8;
 
 fn trauncate_line_for_ai(
@@ -126,7 +118,6 @@ fn trauncate_line_for_ai(
     format!("{}…", &trimmed[..end])
 }
 
-/// Floor to a valid char boundary
 fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
@@ -138,7 +129,6 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-/// Ceil to a valid char boundary
 fn ceil_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
@@ -150,7 +140,6 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
     i
 }
 
-/// Collected file metadata for the first match per file.
 struct FileMeta<'a> {
     file: &'a FileItem,
     line_number: u64,
@@ -160,9 +149,6 @@ struct FileMeta<'a> {
     context_after: Vec<String>,
 }
 
-/// Parameters for [`format_grep_results`].
-///
-/// Groups the read-only inputs so callers don't juggle 10 positional args.
 pub struct GrepFormatter<'a> {
     pub matches: &'a [GrepMatch],
     pub files: &'a [&'a FileItem],
@@ -173,7 +159,7 @@ pub struct GrepFormatter<'a> {
     pub max_results: usize,
     pub show_context: bool,
     pub auto_expand_defs: bool,
-    pub arena: *const u8,
+    pub picker: &'a FilePicker,
 }
 
 impl GrepFormatter<'_> {
@@ -188,7 +174,7 @@ impl GrepFormatter<'_> {
             max_results,
             show_context,
             auto_expand_defs,
-            arena,
+            picker,
         } = *self;
 
         let items = if matches.len() > max_results {
@@ -204,12 +190,12 @@ impl GrepFormatter<'_> {
                 next_file_offset,
                 auto_expand_defs,
                 cursor_store,
-                arena,
+                picker,
             );
         }
 
         if output_mode == OutputMode::Count {
-            return format_count(items, files, next_file_offset, cursor_store, arena);
+            return format_count(items, files, next_file_offset, cursor_store, picker);
         }
 
         // output_mode == usage
@@ -235,15 +221,15 @@ impl GrepFormatter<'_> {
         }
 
         // File overview: collect first match per file
-        let file_preview = collect_file_preview(items, files, arena);
+        let file_preview = collect_file_preview(items, files, picker);
         let mut content_def_file = String::new();
         let mut content_first_file = String::new();
         for fm in &file_preview {
             if content_first_file.is_empty() {
-                content_first_file = fm.file.relative_path(arena).to_string();
+                content_first_file = picker.relative_path(fm.file);
             }
             if content_def_file.is_empty() && fm.is_definition {
-                content_def_file = fm.file.relative_path(arena).to_string();
+                content_def_file = picker.relative_path(fm.file);
             }
         }
 
@@ -298,8 +284,9 @@ impl GrepFormatter<'_> {
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
 
-            if file.relative_path(arena) != current_file {
-                current_file = file.relative_path(arena).to_string();
+            let file_rel_path = picker.relative_path(file);
+            if file_rel_path != current_file {
+                current_file = file_rel_path;
                 match_lines.push(current_file.to_string());
             }
 
@@ -346,18 +333,19 @@ impl GrepFormatter<'_> {
             }
 
             // Auto-expand definitions with body context
+            let file_rel_for_expand = picker.relative_path(file);
             if auto_expand_defs
                 && !show_context
                 && m.is_definition
                 && !m.context_after.is_empty()
-                && !def_expanded_files.contains(&file.relative_path(arena))
+                && !def_expanded_files.contains(&file_rel_for_expand)
             {
                 let expand_limit = if def_expanded_files.is_empty() {
                     MAX_DEF_EXPAND_FIRST
                 } else {
                     MAX_DEF_EXPAND
                 };
-                def_expanded_files.insert(file.relative_path(arena));
+                def_expanded_files.insert(file_rel_for_expand);
                 let start_line = m.line_number + 1;
                 for (i, ctx) in m.context_after.iter().take(expand_limit).enumerate() {
                     if ctx.trim().is_empty() {
@@ -396,9 +384,9 @@ fn format_files_with_matches(
     next_file_offset: usize,
     auto_expand_defs: bool,
     cursor_store: &mut CursorStore,
-    arena: *const u8,
+    picker: &FilePicker,
 ) -> String {
-    let file_map = collect_file_preview(items, files, arena);
+    let file_map = collect_file_preview(items, files, picker);
 
     let mut lines: Vec<String> = Vec::new();
     let file_count = file_map.len();
@@ -408,10 +396,10 @@ fn format_files_with_matches(
     let mut first_file = String::new();
     for fm in &file_map {
         if first_file.is_empty() {
-            first_file = fm.file.relative_path(arena).to_string();
+            first_file = picker.relative_path(fm.file);
         }
         if first_def_file.is_empty() && fm.is_definition {
-            first_def_file = fm.file.relative_path(arena).to_string();
+            first_def_file = picker.relative_path(fm.file);
         }
     }
     let suggest_path = if !first_def_file.is_empty() {
@@ -445,7 +433,7 @@ fn format_files_with_matches(
         let def_tag = if is_def { " [def]" } else { "" };
         lines.push(format!(
             "{}{}{}",
-            fm.file.relative_path(arena),
+            picker.relative_path(fm.file),
             def_tag,
             size_tag(fm.file.size)
         ));
@@ -511,12 +499,12 @@ fn format_count(
     files: &[&FileItem],
     next_file_offset: usize,
     cursor_store: &mut CursorStore,
-    arena: *const u8,
+    picker: &FilePicker,
 ) -> String {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for m in items {
-        let path = files[m.file_index].relative_path(arena);
+        let path = picker.relative_path(files[m.file_index]);
         let count = counts.entry(path.to_string()).or_insert_with(|| {
             order.push(path.to_string());
             0
@@ -538,13 +526,13 @@ fn format_count(
 fn collect_file_preview<'a>(
     items: &[GrepMatch],
     files: &[&'a FileItem],
-    arena: *const u8,
+    picker: &FilePicker,
 ) -> Vec<FileMeta<'a>> {
     let mut file_preview: Vec<FileMeta<'a>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for m in items {
         let file = files[m.file_index];
-        if seen.insert(file.relative_path(arena)) {
+        if seen.insert(picker.relative_path(file)) {
             file_preview.push(FileMeta {
                 file,
                 line_number: m.line_number,

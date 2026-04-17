@@ -2,80 +2,28 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use fff_search::ContentCacheBudget;
-use fff_search::grep::{
-    GrepMode, GrepSearchOptions, grep_search as grep_search_raw, parse_grep_query,
-};
-use fff_search::types::FileItem;
+use fff_search::FilePickerOptions;
+use fff_search::file_picker::FilePicker;
+use fff_search::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 
-/// Create a file inside a temp dir and return its `FileItem` with a working path.
-fn create_file(base: &Path, relative: &str, contents: &str) -> FileItem {
-    let full_path = base.join(relative);
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(&full_path, contents).unwrap();
-    let meta = fs::metadata(&full_path).unwrap();
-    FileItem::new_for_test(relative, meta.len(), 0, None, false)
-}
-
-/// Build a batch of test files sharing one arena. Returns (files, arena).
-fn create_files_batch(base: &Path, specs: &[(&str, &str)]) -> (Vec<FileItem>, *const u8) {
-    let mut sizes = Vec::new();
+/// Build a batch of test files and return a FilePicker with them indexed.
+fn create_picker(base: &Path, specs: &[(&str, &str)]) -> FilePicker {
     for (rel, contents) in specs {
         let full_path = base.join(rel);
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(&full_path, contents).unwrap();
-        let meta = fs::metadata(&full_path).unwrap();
-        sizes.push(meta.len());
     }
-    let paths: Vec<String> = specs.iter().map(|(r, _)| r.to_string()).collect();
-    let raw: Vec<FileItem> = specs
-        .iter()
-        .zip(sizes.iter())
-        .map(|((r, _), &sz)| {
-            let fname = r.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
-            FileItem::new_raw(fname, sz, 0, None, false)
-        })
-        .collect();
-    let (store, strings) =
-        fff_search::simd_path::build_chunked_path_store_from_strings(&paths, &raw);
-    let arena = store.arena_base_ptr();
-    let mut files = raw;
-    for (i, f) in files.iter_mut().enumerate() {
-        f.set_path(strings[i].clone());
-    }
-    std::mem::forget(store);
-    (files, arena)
-}
-
-/// Wrapper that appends `base_path` and `arena` arguments.
-/// In tests, all files are created with proper relative paths from `base`,
-/// so we just pass `base` as the base_path.
-fn grep_search_with_base<'a>(
-    files: &'a [FileItem],
-    query: &fff_search::FFFQuery<'_>,
-    options: &GrepSearchOptions,
-    budget: &ContentCacheBudget,
-    bigram_index: Option<&fff_search::BigramFilter>,
-    bigram_overlay: Option<&fff_search::BigramOverlay>,
-    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
-    base_path: &Path,
-    arena: *const u8,
-) -> fff_search::grep::GrepResult<'a> {
-    grep_search_raw(
-        files,
-        query,
-        options,
-        budget,
-        bigram_index,
-        bigram_overlay,
-        is_cancelled,
-        base_path,
-        arena,
-    )
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_string_lossy().to_string(),
+        warmup_mmap_cache: false,
+        watch: false,
+        ..Default::default()
+    })
+    .expect("Failed to create FilePicker");
+    picker.collect_files().expect("Failed to collect files");
+    picker
 }
 
 /// Shorthand to build default options for plain text mode.
@@ -92,6 +40,7 @@ fn plain_opts() -> GrepSearchOptions {
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: false,
+        abort_signal: None,
     }
 }
 
@@ -109,6 +58,7 @@ fn regex_opts() -> GrepSearchOptions {
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: false,
+        abort_signal: None,
     }
 }
 
@@ -126,29 +76,20 @@ fn fuzzy_opts() -> GrepSearchOptions {
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: false,
+        abort_signal: None,
     }
 }
 
 #[test]
 fn plain_text_finds_exact_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("hello.txt", "Hello, World!\nGoodbye, World!\n")],
     );
 
     let parsed = parse_grep_query("Hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
@@ -158,24 +99,14 @@ fn plain_text_finds_exact_literal() {
 #[test]
 fn plain_text_smart_case_insensitive() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "Hello World\nhello world\nHELLO WORLD\n")],
     );
 
     // All lowercase query → smart case → case-insensitive
     let parsed = parse_grep_query("hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -187,24 +118,14 @@ fn plain_text_smart_case_insensitive() {
 #[test]
 fn plain_text_smart_case_sensitive_with_uppercase() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "Hello World\nhello world\nHELLO WORLD\n")],
     );
 
     // Query has uppercase → smart case → case-sensitive
     let parsed = parse_grep_query("Hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -217,7 +138,7 @@ fn plain_text_smart_case_sensitive_with_uppercase() {
 #[test]
 fn plain_text_regex_metacharacters_are_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "code.rs",
@@ -227,34 +148,14 @@ fn plain_text_regex_metacharacters_are_literal() {
 
     // In plain text mode, these regex metacharacters should be literal
     let parsed = parse_grep_query("fn main()");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
 
     // Parentheses should NOT be treated as regex groups
     let parsed2 = parse_grep_query("(\"test\")");
-    let result2 = grep_search_with_base(
-        &files,
-        &parsed2,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result2 = picker.grep(&parsed2, &plain_opts());
     assert_eq!(result2.matches.len(), 1);
     assert_eq!(result2.matches[0].line_number, 2);
 }
@@ -262,7 +163,7 @@ fn plain_text_regex_metacharacters_are_literal() {
 #[test]
 fn plain_text_dot_is_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "config.toml",
@@ -272,17 +173,7 @@ fn plain_text_dot_is_literal() {
 
     // In plain text mode, dot should be literal, not "any char"
     let parsed = parse_grep_query("1.0");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -295,7 +186,7 @@ fn plain_text_dot_is_literal() {
 #[test]
 fn plain_text_asterisk_is_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "doc.md",
@@ -304,17 +195,7 @@ fn plain_text_asterisk_is_literal() {
     );
 
     let parsed = parse_grep_query("**bold**");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
 }
@@ -322,30 +203,20 @@ fn plain_text_asterisk_is_literal() {
 #[test]
 fn plain_text_backslash_is_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("paths.txt", "C:\\Users\\foo\\bar\n/home/user/bin\n")],
     );
 
     let parsed = parse_grep_query("C:\\Users");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
     assert_eq!(result.matches.len(), 1);
 }
 
 #[test]
 fn plain_text_across_multiple_files() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("a.txt", "use std::io;\nuse std::fs;\n"),
@@ -355,17 +226,7 @@ fn plain_text_across_multiple_files() {
     );
 
     let parsed = parse_grep_query("use std");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 3);
     // Should match in files a.txt and b.txt
@@ -375,20 +236,10 @@ fn plain_text_across_multiple_files() {
 #[test]
 fn plain_text_highlight_offsets_are_correct() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "foo bar foo baz foo\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "foo bar foo baz foo\n")]);
 
     let parsed = parse_grep_query("foo");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     let m = &result.matches[0];
@@ -403,20 +254,10 @@ fn plain_text_highlight_offsets_are_correct() {
 #[test]
 fn plain_text_empty_query_returns_no_content_matches() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "some content\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "some content\n")]);
 
     let parsed = parse_grep_query("");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     // Empty query in grep returns git-modified welcome state (no content matches)
     // Since our test files have no git status, we expect 0 matches
@@ -426,48 +267,39 @@ fn plain_text_empty_query_returns_no_content_matches() {
 #[test]
 fn plain_text_binary_files_are_skipped() {
     let tmp = TempDir::new().unwrap();
-    let binary_path = tmp.path().join("binary.dat");
     let mut bin_content = b"match this text\n".to_vec();
     bin_content.extend_from_slice(&[0u8; 100]); // NUL bytes make it binary
     bin_content.extend_from_slice(b"match this text\n");
-    fs::write(&binary_path, &bin_content).unwrap();
 
-    // Write the text file too
-    fs::write(tmp.path().join("text.txt"), "match this text\n").unwrap();
+    // Initialize a git repo so the picker indexes binary-extension files
+    // (marking them as binary) rather than skipping them entirely.
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(tmp.path())
+        .status()
+        .expect("git init failed");
 
-    // Build both files sharing one arena. The binary file is marked is_binary=true.
-    let bin_meta = fs::metadata(&binary_path).unwrap();
-    let txt_meta = fs::metadata(tmp.path().join("text.txt")).unwrap();
-    let paths = vec!["binary.dat".to_string(), "text.txt".to_string()];
-    let mut raw = vec![
-        FileItem::new_raw(0, bin_meta.len(), 0, None, true),
-        FileItem::new_raw(0, txt_meta.len(), 0, None, false),
-    ];
-    let (store, strings) =
-        fff_search::simd_path::build_chunked_path_store_from_strings(&paths, &raw);
-    let arena = store.arena_base_ptr();
-    for (i, f) in raw.iter_mut().enumerate() {
-        f.set_path(strings[i].clone());
-    }
-    std::mem::forget(store);
-    let files = raw;
+    // Use a known binary extension so the picker's scan-time heuristic marks
+    // it as binary without needing mutable post-hoc access.
+    fs::write(tmp.path().join("binary.png"), &bin_content).unwrap();
+
+    // create_picker writes text.txt and then scans the directory, picking up
+    // both binary.png (already on disk) and text.txt.
+    let picker = create_picker(tmp.path(), &[("text.txt", "match this text\n")]);
+
+    // binary.png should have been auto-detected as binary by extension heuristic
+    let has_binary = picker
+        .get_files()
+        .iter()
+        .any(|f| picker.relative_path(f).contains("binary.png") && f.is_binary());
+    assert!(has_binary, "binary.png should be detected as binary");
 
     let parsed = parse_grep_query("match this text");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     // Only the text file should be searched, not the binary one
     assert_eq!(result.files.len(), 1);
-    assert!(result.files[0].relative_path(arena).contains("text.txt"));
+    assert!(picker.relative_path(result.files[0]).contains("text.txt"));
 }
 
 #[test]
@@ -478,23 +310,13 @@ fn plain_text_max_matches_per_file() {
         content.push_str(&format!("line {} match_target\n", i));
     }
     fs::write(tmp.path().join("many.txt"), &content).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("many.txt", &content)]);
+    let picker = create_picker(tmp.path(), &[("many.txt", &content)]);
 
     let mut opts = plain_opts();
     opts.max_matches_per_file = 5;
 
     let parsed = parse_grep_query("match_target");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &opts,
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &opts);
 
     assert_eq!(
         result.matches.len(),
@@ -511,23 +333,13 @@ fn plain_text_page_limit() {
         content.push_str(&format!("line {} target\n", i));
     }
     fs::write(tmp.path().join("big.txt"), &content).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("big.txt", &content)]);
+    let picker = create_picker(tmp.path(), &[("big.txt", &content)]);
 
     let mut opts = plain_opts();
     opts.page_limit = 10;
 
     let parsed = parse_grep_query("target");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &opts,
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &opts);
 
     // page_limit is a soft minimum: we always finish the current file, so we
     // get at least page_limit matches (no data loss) and at most
@@ -563,7 +375,7 @@ fn plain_text_file_offset_pagination() {
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    let (files, arena) = create_files_batch(tmp.path(), &spec_refs);
+    let picker = create_picker(tmp.path(), &spec_refs);
 
     let mut opts = plain_opts();
     opts.page_limit = 5;
@@ -575,17 +387,7 @@ fn plain_text_file_offset_pagination() {
 
     loop {
         let parsed = parse_grep_query("unique_token");
-        let result = grep_search_with_base(
-            &files,
-            &parsed,
-            &opts,
-            &ContentCacheBudget::unlimited(),
-            None,
-            None,
-            None,
-            tmp.path(),
-            arena,
-        );
+        let result = picker.grep(&parsed, &opts);
 
         for m in &result.matches {
             let text = m.line_content.trim().to_string();
@@ -629,23 +431,13 @@ fn plain_text_file_offset_pagination() {
 #[test]
 fn plain_text_line_numbers_are_correct() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "line one\nline two\nline three\nline four\n")],
     );
 
     let parsed = parse_grep_query("line");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 4);
     assert_eq!(result.matches[0].line_number, 1);
@@ -660,23 +452,13 @@ fn plain_text_max_file_size_filter() {
     // Create a file larger than 100 bytes
     let big_content = "a".repeat(200) + "\nmatch_me\n";
     fs::write(tmp.path().join("big.txt"), &big_content).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("big.txt", &big_content)]);
+    let picker = create_picker(tmp.path(), &[("big.txt", &big_content)]);
 
     let mut opts = plain_opts();
     opts.max_file_size = 100; // Only allow files up to 100 bytes
 
     let parsed = parse_grep_query("match_me");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &opts,
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &opts);
 
     assert_eq!(result.matches.len(), 0, "large file should be filtered out");
     assert_eq!(result.filtered_file_count, 0);
@@ -687,23 +469,13 @@ fn plain_text_max_file_size_filter() {
 #[test]
 fn regex_basic_pattern() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "foo123\nbar456\nbaz789\nfoo_bar\n")],
     );
 
     let parsed = parse_grep_query("foo\\d+");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
@@ -713,21 +485,11 @@ fn regex_basic_pattern() {
 #[test]
 fn regex_capture_group_matching() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "foobar\nfoobaz\nfoo123\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "foobar\nfoobaz\nfoo123\n")]);
 
     // Use a capturing group (not lookahead, which regex crate doesn't support)
     let parsed = parse_grep_query("foo(bar|baz)");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 2);
     let contents: Vec<&str> = result
@@ -742,22 +504,11 @@ fn regex_capture_group_matching() {
 #[test]
 fn regex_dot_matches_any_char() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "v1.0\nv1x0\nv1-0\nv100\nv2.0\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "v1.0\nv1x0\nv1-0\nv100\nv2.0\n")]);
 
     // In regex mode, . matches any character, so v1.0 matches v1.0, v1x0, v1-0, and v100
     let parsed = parse_grep_query("v1.0");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -769,21 +520,10 @@ fn regex_dot_matches_any_char() {
 #[test]
 fn regex_alternation() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "apple\nbanana\ncherry\napricot\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "apple\nbanana\ncherry\napricot\n")]);
 
     let parsed = parse_grep_query("apple|cherry");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 2);
     let lines: Vec<u64> = result.matches.iter().map(|m| m.line_number).collect();
@@ -794,20 +534,10 @@ fn regex_alternation() {
 #[test]
 fn regex_character_class() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "cat\ncut\ncot\ncit\ncxt\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "cat\ncut\ncot\ncit\ncxt\n")]);
 
     let parsed = parse_grep_query("c[aou]t");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 3);
     let contents: Vec<&str> = result
@@ -823,21 +553,10 @@ fn regex_character_class() {
 #[test]
 fn regex_quantifiers() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "fo\nfoo\nfooo\nfoooo\nbar\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "fo\nfoo\nfooo\nfoooo\nbar\n")]);
 
     let parsed = parse_grep_query("fo{2,3}");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 3, "should match foo, fooo, foooo");
 }
@@ -845,23 +564,13 @@ fn regex_quantifiers() {
 #[test]
 fn regex_anchors() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "start of line\nmiddle start end\nend of line\n")],
     );
 
     let parsed = parse_grep_query("^start");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
@@ -870,7 +579,7 @@ fn regex_anchors() {
 #[test]
 fn regex_anchors_multiword() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "test.c",
@@ -880,17 +589,7 @@ fn regex_anchors_multiword() {
 
     // ^int ff_ should match lines starting with "int ff_"
     let parsed = parse_grep_query("^int ff_");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -904,20 +603,10 @@ fn regex_anchors_multiword() {
 #[test]
 fn regex_highlight_offsets_variable_length() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "aab aaab aaaab\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "aab aaab aaaab\n")]);
 
     let parsed = parse_grep_query("a+b");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(result.matches.len(), 1);
     let m = &result.matches[0];
@@ -932,22 +621,11 @@ fn regex_highlight_offsets_variable_length() {
 #[test]
 fn regex_invalid_pattern_falls_back_to_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "call name(arg)\nother line\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "call name(arg)\nother line\n")]);
 
     // Invalid regex: unmatched group — should fall back to literal search
     let parsed = parse_grep_query("name(");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     // Fallback to literal: finds "name(" in "call name(arg)"
     assert_eq!(
@@ -963,17 +641,7 @@ fn regex_invalid_pattern_falls_back_to_literal() {
 
     // A pattern that doesn't exist anywhere — still falls back but finds nothing
     let parsed2 = parse_grep_query("zzz(");
-    let result2 = grep_search_with_base(
-        &files,
-        &parsed2,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result2 = picker.grep(&parsed2, &regex_opts());
     assert_eq!(result2.matches.len(), 0);
     assert!(result2.regex_fallback_error.is_some());
 }
@@ -981,44 +649,23 @@ fn regex_invalid_pattern_falls_back_to_literal() {
 #[test]
 fn regex_smart_case() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "Foo bar\nfoo bar\nFOO BAR\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "Foo bar\nfoo bar\nFOO BAR\n")]);
 
     // Lowercase query → case-insensitive
     let parsed_lower = parse_grep_query("foo");
-    let result_lower = grep_search_with_base(
-        &files,
-        &parsed_lower,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result_lower = picker.grep(&parsed_lower, &regex_opts());
     assert_eq!(result_lower.matches.len(), 3);
 
     // Query with uppercase → case-sensitive
     let parsed_upper = parse_grep_query("Foo");
-    let result_upper = grep_search_with_base(
-        &files,
-        &parsed_upper,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result_upper = picker.grep(&parsed_upper, &regex_opts());
     assert_eq!(result_upper.matches.len(), 1);
 }
 
 #[test]
 fn regex_across_multiple_files() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("lib.rs", "fn main() {}\nfn helper() {}\nstruct Foo;\n"),
@@ -1031,17 +678,7 @@ fn regex_across_multiple_files() {
     );
 
     let parsed = parse_grep_query("fn \\w+\\(\\)");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     // Should match: fn main(), fn helper(), fn test_one(), fn test_two()
     assert_eq!(result.matches.len(), 4);
@@ -1053,34 +690,14 @@ fn regex_across_multiple_files() {
 #[test]
 fn plain_text_and_regex_agree_on_simple_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "hello world\ngoodbye world\nhello again\n")],
     );
 
     let parsed = parse_grep_query("hello");
-    let plain_result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
-    let regex_result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let plain_result = picker.grep(&parsed, &plain_opts());
+    let regex_result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(plain_result.matches.len(), regex_result.matches.len());
     for (p, r) in plain_result.matches.iter().zip(regex_result.matches.iter()) {
@@ -1092,36 +709,16 @@ fn plain_text_and_regex_agree_on_simple_literal() {
 #[test]
 fn plain_text_escapes_what_regex_does_not() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "price is $100\nprice is 100\nprice is $200\n")],
     );
 
     // "$100" — in plain text, $ is literal; in regex, $ is anchor
     let parsed_plain = parse_grep_query("$100");
-    let plain_result = grep_search_with_base(
-        &files,
-        &parsed_plain,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let plain_result = picker.grep(&parsed_plain, &plain_opts());
     let parsed_regex = parse_grep_query("\\$100");
-    let regex_result = grep_search_with_base(
-        &files,
-        &parsed_regex,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let regex_result = picker.grep(&parsed_regex, &regex_opts());
 
     // Plain text should find "$100" literally
     assert_eq!(plain_result.matches.len(), 1);
@@ -1136,7 +733,7 @@ fn plain_text_escapes_what_regex_does_not() {
 #[test]
 fn grep_with_extension_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("a.rs", "use std::io;\nfn main() {}\n"),
@@ -1146,24 +743,14 @@ fn grep_with_extension_constraint() {
     );
 
     let parsed = parse_grep_query("use std *.rs");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            file.relative_path(arena).ends_with(".rs"),
+            picker.relative_path(file).ends_with(".rs"),
             "should only match .rs files, got: {}",
-            file.relative_path(arena)
+            picker.relative_path(file)
         );
     }
     assert!(
@@ -1177,7 +764,7 @@ fn grep_with_extension_constraint() {
 #[test]
 fn plain_text_bracket_is_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "code.rs",
@@ -1186,17 +773,7 @@ fn plain_text_bracket_is_literal() {
     );
 
     let parsed = parse_grep_query("arr[0]");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1211,7 +788,7 @@ fn plain_text_bracket_is_literal() {
 #[test]
 fn grep_backslash_escapes_extension_filter() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("a.rs", "contains *.rs pattern\n"),
@@ -1221,17 +798,7 @@ fn grep_backslash_escapes_extension_filter() {
 
     // Without escape: "*.rs" is an extension filter, so only .rs files are searched
     let parsed = parse_grep_query("pattern *.rs");
-    let result_filter = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result_filter = picker.grep(&parsed, &plain_opts());
     assert_eq!(
         result_filter.files.len(),
         1,
@@ -1240,17 +807,7 @@ fn grep_backslash_escapes_extension_filter() {
 
     // With escape: "\*.rs" is literal text, both files are searched
     let parsed_escaped = parse_grep_query("\\*.rs");
-    let result_literal = grep_search_with_base(
-        &files,
-        &parsed_escaped,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result_literal = picker.grep(&parsed_escaped, &plain_opts());
     assert_eq!(
         result_literal.matches.len(),
         2,
@@ -1261,7 +818,7 @@ fn grep_backslash_escapes_extension_filter() {
 #[test]
 fn grep_backslash_escapes_path_segment() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("src/main.rs", "search for /src/ path\n"),
@@ -1271,17 +828,7 @@ fn grep_backslash_escapes_path_segment() {
 
     // With escape: "\\/src/" is literal text, not a path constraint
     let parsed = parse_grep_query("\\/src/");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
     assert_eq!(
         result.matches.len(),
         2,
@@ -1292,22 +839,11 @@ fn grep_backslash_escapes_path_segment() {
 #[test]
 fn grep_backslash_escapes_negation() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "the !test macro\nother stuff\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "the !test macro\nother stuff\n")]);
 
     // With escape: "\\!test" is literal text "!test"
     let parsed = parse_grep_query("\\!test");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
     assert_eq!(result.matches.len(), 1);
     assert!(result.matches[0].line_content.contains("!test"));
 }
@@ -1315,7 +851,7 @@ fn grep_backslash_escapes_negation() {
 #[test]
 fn grep_with_path_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("src/lib.rs", "target_text\n"),
@@ -1325,20 +861,10 @@ fn grep_with_path_constraint() {
     );
 
     let parsed = parse_grep_query("target_text /src/");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
-    assert!(result.files[0].relative_path(arena).starts_with("src/"));
+    assert!(picker.relative_path(result.files[0]).starts_with("src/"));
 }
 
 // ── Negated constraint tests ───────────────────────────────────────────
@@ -1346,7 +872,7 @@ fn grep_with_path_constraint() {
 #[test]
 fn grep_with_negated_extension_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("src/lib.rs", "target_text\n"),
@@ -1357,17 +883,7 @@ fn grep_with_negated_extension_constraint() {
 
     let query = "target_text !*.rs";
     let parsed = parse_grep_query(query);
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1376,16 +892,16 @@ fn grep_with_negated_extension_constraint() {
         result.matches.len()
     );
     assert!(
-        result.files[0].relative_path(arena).ends_with(".ts"),
+        picker.relative_path(result.files[0]).ends_with(".ts"),
         "should only match .ts file, got: {}",
-        result.files[0].relative_path(arena)
+        picker.relative_path(result.files[0])
     );
 }
 
 #[test]
 fn grep_with_negated_path_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("src/lib.rs", "target_text\n"),
@@ -1396,17 +912,7 @@ fn grep_with_negated_path_constraint() {
 
     let query = "target_text !/src/";
     let parsed = parse_grep_query(query);
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1415,16 +921,16 @@ fn grep_with_negated_path_constraint() {
         result.matches.len()
     );
     assert!(
-        result.files[0].relative_path(arena).starts_with("tests/"),
+        picker.relative_path(result.files[0]).starts_with("tests/"),
         "should only match tests/ file, got: {}",
-        result.files[0].relative_path(arena)
+        picker.relative_path(result.files[0])
     );
 }
 
 #[test]
 fn grep_with_negated_text_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("src/lib.rs", "target_text\n"),
@@ -1435,17 +941,7 @@ fn grep_with_negated_text_constraint() {
 
     let query = "target_text !test";
     let parsed = parse_grep_query(query);
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     // "tests/helper.rs" contains "test" in path, should be excluded
     assert_eq!(
@@ -1456,9 +952,9 @@ fn grep_with_negated_text_constraint() {
     );
     for file in &result.files {
         assert!(
-            !file.relative_path(arena).contains("test"),
+            !picker.relative_path(file).contains("test"),
             "should not match files with 'test' in path, got: {}",
-            file.relative_path(arena)
+            picker.relative_path(file)
         );
     }
 }
@@ -1468,21 +964,10 @@ fn grep_with_negated_text_constraint() {
 #[test]
 fn grep_empty_file_is_skipped() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("empty.txt", ""), ("text.txt", "findme\n")]);
+    let picker = create_picker(tmp.path(), &[("empty.txt", ""), ("text.txt", "findme\n")]);
 
     let parsed = parse_grep_query("findme");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
 }
@@ -1490,20 +975,10 @@ fn grep_empty_file_is_skipped() {
 #[test]
 fn grep_single_line_no_trailing_newline() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "no newline at end")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "no newline at end")]);
 
     let parsed = parse_grep_query("no newline");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 1);
@@ -1512,38 +987,18 @@ fn grep_single_line_no_trailing_newline() {
 #[test]
 fn grep_unicode_content() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("utf8.txt", "日本語テスト\nrégulière\nñoño\n")],
     );
 
     let parsed = parse_grep_query("régulière");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].line_number, 2);
 
     let parsed2 = parse_grep_query("ñoño");
-    let result2 = grep_search_with_base(
-        &files,
-        &parsed2,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result2 = picker.grep(&parsed2, &plain_opts());
     assert_eq!(result2.matches.len(), 1);
     assert_eq!(result2.matches[0].line_number, 3);
 }
@@ -1553,20 +1008,10 @@ fn grep_long_line_is_truncated() {
     let tmp = TempDir::new().unwrap();
     let long_line = format!("{}NEEDLE{}", "x".repeat(1000), "y".repeat(1000));
     fs::write(tmp.path().join("long.txt"), &long_line).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("long.txt", &long_line)]);
+    let picker = create_picker(tmp.path(), &[("long.txt", &long_line)]);
 
     let parsed = parse_grep_query("NEEDLE");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     // The line_content should be truncated to MAX_LINE_DISPLAY_LEN (512)
@@ -1580,21 +1025,10 @@ fn grep_long_line_is_truncated() {
 #[test]
 fn regex_word_boundary() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("a.txt", "foo\nfoobar\nbarfoo\nfoo_baz\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "foo\nfoobar\nbarfoo\nfoo_baz\n")]);
 
     let parsed = parse_grep_query("\\bfoo\\b");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1607,7 +1041,7 @@ fn regex_word_boundary() {
 #[test]
 fn plain_text_question_mark_is_literal() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "a.txt",
@@ -1616,17 +1050,7 @@ fn plain_text_question_mark_is_literal() {
     );
 
     let parsed = parse_grep_query("?");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1638,7 +1062,7 @@ fn plain_text_question_mark_is_literal() {
 #[test]
 fn plain_text_query_with_question_mark_in_word() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "code.rs",
@@ -1647,17 +1071,7 @@ fn plain_text_query_with_question_mark_in_word() {
     );
 
     let parsed = parse_grep_query("foo?");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1669,21 +1083,11 @@ fn plain_text_query_with_question_mark_in_word() {
 #[test]
 fn regex_question_mark_is_quantifier() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "color\ncolour\ncolouur\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "color\ncolour\ncolouur\n")]);
 
     // In regex mode, ? means "zero or one of preceding"
     let parsed = parse_grep_query("colou?r");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &regex_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &regex_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1697,23 +1101,13 @@ fn regex_question_mark_is_quantifier() {
 #[test]
 fn fuzzy_finds_exact_substring() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("a.txt", "hello world\ngoodbye world\nhello again\n")],
     );
 
     let parsed = parse_grep_query("hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -1727,7 +1121,7 @@ fn fuzzy_finds_exact_substring() {
 #[test]
 fn fuzzy_finds_scattered_characters() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "code.rs",
@@ -1737,17 +1131,7 @@ fn fuzzy_finds_scattered_characters() {
 
     // "mutex" should fuzzy match "mutex_lock" (contiguous prefix)
     let parsed = parse_grep_query("mutex");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     assert!(
         !result.matches.is_empty(),
@@ -1759,20 +1143,10 @@ fn fuzzy_finds_scattered_characters() {
 #[test]
 fn fuzzy_highlight_offsets_correct() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "hello world\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "hello world\n")]);
 
     let parsed = parse_grep_query("hell");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     assert_eq!(result.matches.len(), 1);
     let m = &result.matches[0];
@@ -1788,7 +1162,7 @@ fn fuzzy_highlight_offsets_correct() {
 #[test]
 fn fuzzy_unicode_char_indices() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("utf8.txt", "日本語テスト\nrégulière\nñoño\n")],
     );
@@ -1796,17 +1170,7 @@ fn fuzzy_unicode_char_indices() {
     // Use "guli" which is a contiguous ASCII substring within "régulière"
     // (the chars g-u-l-i appear contiguously between the two accented chars)
     let parsed = parse_grep_query("guli");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     // Should fuzzy match "régulière" (with multi-byte é and è)
     // This tests that character-to-byte offset conversion works with UTF-8
@@ -1817,20 +1181,10 @@ fn fuzzy_unicode_char_indices() {
 #[test]
 fn fuzzy_empty_query_returns_empty() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("a.txt", "some content\n")]);
+    let picker = create_picker(tmp.path(), &[("a.txt", "some content\n")]);
 
     let parsed = parse_grep_query("");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     // Empty query returns git-modified files, not fuzzy matches
     assert_eq!(result.matches.len(), 0);
@@ -1839,7 +1193,7 @@ fn fuzzy_empty_query_returns_empty() {
 #[test]
 fn fuzzy_with_extension_constraint() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[
             ("a.rs", "use std::io;\nfn main() {}\n"),
@@ -1849,24 +1203,14 @@ fn fuzzy_with_extension_constraint() {
     );
 
     let parsed = parse_grep_query("use std *.rs");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            file.relative_path(arena).ends_with(".rs"),
+            picker.relative_path(file).ends_with(".rs"),
             "should only match .rs files, got: {}",
-            file.relative_path(arena)
+            picker.relative_path(file)
         );
     }
 }
@@ -1879,24 +1223,14 @@ fn fuzzy_respects_page_limit() {
         content.push_str(&format!("line {} target\n", i));
     }
     fs::write(tmp.path().join("big.txt"), &content).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("big.txt", &content)]);
+    let picker = create_picker(tmp.path(), &[("big.txt", &content)]);
 
     let mut opts = fuzzy_opts();
     opts.page_limit = 10;
     opts.max_matches_per_file = 50;
 
     let parsed = parse_grep_query("target");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &opts,
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &opts);
 
     // page_limit is a soft minimum: we always finish the current file, so we
     // get at least page_limit matches (no data loss) and at most
@@ -1927,23 +1261,13 @@ fn fuzzy_respects_max_matches_per_file() {
         content.push_str(&format!("line {} match_target\n", i));
     }
     fs::write(tmp.path().join("many.txt"), &content).unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("many.txt", &content)]);
+    let picker = create_picker(tmp.path(), &[("many.txt", &content)]);
 
     let mut opts = fuzzy_opts();
     opts.max_matches_per_file = 5;
 
     let parsed = parse_grep_query("match");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &opts,
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &opts);
 
     assert_eq!(
         result.matches.len(),
@@ -1955,7 +1279,7 @@ fn fuzzy_respects_max_matches_per_file() {
 #[test]
 fn fuzzy_filters_low_quality_matches() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "code.rs",
@@ -1966,17 +1290,7 @@ fn fuzzy_filters_low_quality_matches() {
     // Search for "abc" - should match "abc_def_ghi" and "abcdefghij" with high scores,
     // but NOT "xyz" (no relation) or "mutex_lock" (only weak letter overlap)
     let parsed = parse_grep_query("abc");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     // Should only get high-quality matches
     assert!(
@@ -1998,24 +1312,14 @@ fn fuzzy_filters_low_quality_matches() {
 #[test]
 fn fuzzy_exact_match_always_passes() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[("test.txt", "exact match line\nno match here\n")],
     );
 
     // Exact matches should always pass regardless of score threshold
     let parsed = parse_grep_query("exact");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     assert_eq!(
         result.matches.len(),
@@ -2028,21 +1332,10 @@ fn fuzzy_exact_match_always_passes() {
 #[test]
 fn fuzzy_score_is_captured() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) =
-        create_files_batch(tmp.path(), &[("test.txt", "hello world\ngoodbye world\n")]);
+    let picker = create_picker(tmp.path(), &[("test.txt", "hello world\ngoodbye world\n")]);
 
     let parsed = parse_grep_query("hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &fuzzy_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &fuzzy_opts());
 
     assert_eq!(result.matches.len(), 1);
     let m = &result.matches[0];
@@ -2061,20 +1354,10 @@ fn fuzzy_score_is_captured() {
 #[test]
 fn fuzzy_score_is_none_in_plain_mode() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(tmp.path(), &[("test.txt", "hello world\n")]);
+    let picker = create_picker(tmp.path(), &[("test.txt", "hello world\n")]);
 
     let parsed = parse_grep_query("hello");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
     let m = &result.matches[0];
@@ -2092,7 +1375,7 @@ fn fuzzy_score_is_none_in_plain_mode() {
 #[test]
 fn plain_text_smart_case_finds_uppercase_content_with_lowercase_query() {
     let tmp = TempDir::new().unwrap();
-    let (files, arena) = create_files_batch(
+    let picker = create_picker(
         tmp.path(),
         &[(
             "driver.c",
@@ -2101,17 +1384,7 @@ fn plain_text_smart_case_finds_uppercase_content_with_lowercase_query() {
     );
 
     let parsed = parse_grep_query("vfio-kvm");
-    let result = grep_search_with_base(
-        &files,
-        &parsed,
-        &plain_opts(),
-        &ContentCacheBudget::unlimited(),
-        None,
-        None,
-        None,
-        tmp.path(),
-        arena,
-    );
+    let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(
         result.matches.len(),

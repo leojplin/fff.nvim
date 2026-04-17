@@ -630,6 +630,7 @@ fn grep_plain_opts() -> GrepSearchOptions {
         after_context: 0,
         classify_definitions: false,
         trim_whitespace: false,
+        abort_signal: None,
     }
 }
 
@@ -688,11 +689,9 @@ fn extract_stem(name: &str) -> String {
 }
 
 fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
-    let arena = picker.arena_base_ptr();
     let parser = QueryParser::default();
     let parsed = parser.parse(query);
-    let result = FilePicker::fuzzy_search(
-        picker.get_files(),
+    let result = picker.fuzzy_search(
         &parsed,
         None,
         FuzzySearchOptions {
@@ -703,12 +702,11 @@ fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
             },
             ..Default::default()
         },
-        arena,
     );
     result
         .items
         .iter()
-        .map(|f| f.relative_path(arena).to_string())
+        .map(|f| picker.relative_path(f))
         .collect()
 }
 

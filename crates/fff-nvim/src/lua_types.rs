@@ -1,26 +1,27 @@
+use fff::file_picker::FilePicker;
 use fff::git::format_git_status;
 use fff::{FileItem, GrepResult, Location, Score, SearchResult};
 use mlua::prelude::*;
 
 pub struct SearchResultLua<'a> {
     inner: SearchResult<'a>,
-    arena: *const u8,
+    picker: &'a FilePicker,
 }
 
 impl<'a> SearchResultLua<'a> {
-    pub fn new(inner: SearchResult<'a>, arena: *const u8) -> Self {
-        Self { inner, arena }
+    pub fn new(inner: SearchResult<'a>, picker: &'a FilePicker) -> Self {
+        Self { inner, picker }
     }
 }
 
 pub struct GrepResultLua<'a> {
     inner: GrepResult<'a>,
-    arena: *const u8,
+    picker: &'a FilePicker,
 }
 
 impl<'a> GrepResultLua<'a> {
-    pub fn new(inner: GrepResult<'a>, arena: *const u8) -> Self {
-        Self { inner, arena }
+    pub fn new(inner: GrepResult<'a>, picker: &'a FilePicker) -> Self {
+        Self { inner, picker }
     }
 }
 
@@ -35,11 +36,11 @@ impl IntoLua for LuaPosition {
     }
 }
 
-fn file_item_into_lua(item: &FileItem, lua: &Lua, arena: *const u8) -> LuaResult<LuaValue> {
+fn file_item_into_lua(item: &FileItem, lua: &Lua, picker: &FilePicker) -> LuaResult<LuaValue> {
     let table = lua.create_table()?;
-    table.set("path", item.relative_path(arena))?;
-    table.set("relative_path", item.relative_path(arena))?;
-    table.set("name", item.file_name(arena))?;
+    let rel_path = picker.relative_path(item);
+    table.set("relative_path", rel_path)?;
+    table.set("name", picker.file_name(item))?;
     table.set("size", item.size)?;
     table.set("modified", item.modified)?;
     table.set("access_frecency_score", item.access_frecency_score)?;
@@ -76,7 +77,7 @@ impl IntoLua for SearchResultLua<'_> {
         // Convert items
         let items_table = lua.create_table()?;
         for (i, item) in self.inner.items.iter().enumerate() {
-            items_table.set(i + 1, file_item_into_lua(item, lua, self.arena)?)?;
+            items_table.set(i + 1, file_item_into_lua(item, lua, self.picker)?)?;
         }
         table.set("items", items_table)?;
 
@@ -125,9 +126,9 @@ impl IntoLua for GrepResultLua<'_> {
 
             // File metadata from the deduplicated files vec
             let file = self.inner.files[m.file_index];
-            item.set("path", file.relative_path(self.arena))?;
-            item.set("relative_path", file.relative_path(self.arena))?;
-            item.set("name", file.file_name(self.arena))?;
+            let rel_path = self.picker.relative_path(file);
+            item.set("relative_path", rel_path)?;
+            item.set("name", self.picker.file_name(file))?;
             item.set("is_binary", file.is_binary())?;
             item.set("git_status", format_git_status(file.git_status))?;
             item.set("size", file.size)?;
