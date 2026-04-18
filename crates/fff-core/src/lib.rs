@@ -85,7 +85,7 @@
 //! );
 //!
 //! assert!(results.total_matched > 0);
-//! assert!(picker.relative_path(results.items.first().unwrap()).ends_with("lib.rs"));
+//! assert!(results.items.first().unwrap().relative_path(picker).ends_with("lib.rs"));
 //!
 //! let _ = std::fs::remove_dir_all(&tmp);
 //! # Ok::<(), Box<dyn std::error::Error>>(())

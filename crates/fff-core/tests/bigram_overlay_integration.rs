@@ -283,7 +283,7 @@ fn new_file_findable_after_add() {
         let overflow = picker.get_overflow_files();
         assert_eq!(overflow.len(), 1, "Should have 1 overflow file");
         assert!(
-            picker.relative_path(&overflow[0]).ends_with("newcomer.txt"),
+            overflow[0].relative_path(picker).ends_with("newcomer.txt"),
             "Overflow file should be newcomer.txt"
         );
     }

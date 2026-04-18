@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !files.is_empty() {
                 println!("Sample files:");
                 for (i, file) in files.iter().take(5).enumerate() {
-                    println!("  {}. {}", i + 1, picker.relative_path(file));
+                    println!("  {}. {}", i + 1, file.relative_path(picker));
                 }
             }
             files.len()

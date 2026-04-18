@@ -706,7 +706,7 @@ fn fuzzy_search_paths(picker: &FilePicker, query: &str) -> Vec<String> {
     result
         .items
         .iter()
-        .map(|f| picker.relative_path(f))
+        .map(|f| f.relative_path(picker))
         .collect()
 }
 

@@ -30,6 +30,7 @@
 //! The background scanner and watcher acquire write locks only when mutating
 //! the file index, so read-heavy search workloads rarely contend.
 
+use crate::FFFStringStorage;
 use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::{BigramFilter, BigramIndexBuilder, BigramOverlay};
 use crate::error::Error;
@@ -226,7 +227,7 @@ impl FileSync {
         // Binary search files by (parent_dir, filename) — same order as the sort
         self.files[..self.base_count].binary_search_by(|f| {
             f.parent_dir_index().cmp(&dir_idx).then_with(|| {
-                let fname = f.file_name_from_arena(arena);
+                let fname = f.file_name(arena);
                 fname.as_str().cmp(filename)
             })
         })
@@ -247,19 +248,31 @@ impl FileSync {
         self.files.insert(position, file);
     }
 
-    /// Remove files matching predicate from both base and overflow.
-    /// Returns number of files removed. Adjusts `base_count` accordingly.
-    fn retain_files<F>(&mut self, mut predicate: F) -> usize
+    fn retain_files_with_arena<F>(&mut self, mut predicate: F) -> usize
     where
-        F: FnMut(&FileItem) -> bool,
+        F: FnMut(&FileItem, ArenaPtr) -> bool,
     {
+        let base_arena = self.arena_base_ptr();
+        let overflow_arena = self.overflow_arena_ptr();
+
+        let base_count = self.base_count;
         let initial_len = self.files.len();
-        // Count how many base files survive.
-        let base_retained = self.files[..self.base_count]
+        let base_retained = self.files[..base_count]
             .iter()
-            .filter(|f| predicate(f))
+            .filter(|f| predicate(f, base_arena))
             .count();
-        self.files.retain(predicate);
+
+        self.files.retain(|f| {
+            predicate(
+                f,
+                if f.is_overflow() {
+                    overflow_arena
+                } else {
+                    base_arena
+                },
+            )
+        });
+
         self.base_count = base_retained;
         initial_len - self.files.len()
     }
@@ -435,50 +448,26 @@ impl std::fmt::Debug for FilePicker {
     }
 }
 
-impl FilePicker {
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
+impl FFFStringStorage for &FilePicker {
+    #[inline]
+    fn arena_for(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
+        self.sync_data.arena_for_file(file)
     }
 
     #[inline]
-    pub(crate) fn arena_base_ptr(&self) -> ArenaPtr {
+    fn base_arena(&self) -> crate::simd_path::ArenaPtr {
         self.sync_data.arena_base_ptr()
     }
 
-    /// File name (e.g. `Button.tsx`) from the arena.
     #[inline]
-    pub fn file_name(&self, file: &FileItem) -> String {
-        file.file_name_from_arena(self.sync_data.arena_for_file(file))
+    fn overflow_arena(&self) -> crate::simd_path::ArenaPtr {
+        self.sync_data.overflow_arena_ptr()
     }
+}
 
-    /// Relative path (e.g. `src/components/Button.tsx`) from the arena.
-    #[inline]
-    pub fn relative_path(&self, file: &FileItem) -> String {
-        file.relative_path_from_arena(self.sync_data.arena_for_file(file))
-    }
-
-    /// Directory portion of the path (e.g. `src/components/`).
-    #[inline]
-    pub fn dir_str(&self, file: &FileItem) -> String {
-        file.dir_str(self.sync_data.arena_for_file(file))
-    }
-
-    /// Absolute path on disk.
-    #[inline]
-    pub fn absolute_path(&self, file: &FileItem) -> PathBuf {
-        file.absolute_path(self.sync_data.arena_for_file(file), &self.base_path)
-    }
-
-    /// Relative path of a directory entry.
-    #[inline]
-    pub fn dir_relative_path(&self, dir: &DirItem) -> String {
-        dir.relative_path(self.sync_data.arena_base_ptr())
-    }
-
-    /// Absolute path of a directory entry.
-    #[inline]
-    pub fn dir_absolute_path(&self, dir: &DirItem) -> PathBuf {
-        dir.absolute_path(self.sync_data.arena_base_ptr(), &self.base_path)
+impl FilePicker {
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
     }
 
     /// Convert an absolute path to a relative path string (relative to base_path).
@@ -1179,17 +1168,16 @@ impl FilePicker {
     // TODO make this O(n)
     pub fn remove_all_files_in_dir(&mut self, dir: impl AsRef<Path>) -> usize {
         let dir_path = dir.as_ref();
-        let dir_rel = self.to_relative_path(dir_path).unwrap_or("").to_string();
-        let dir_prefix = if dir_rel.is_empty() {
+        let relative_dir = self.to_relative_path(dir_path).unwrap_or("").to_string();
+
+        let dir_prefix = if relative_dir.is_empty() {
             String::new()
         } else {
-            format!("{}/", dir_rel)
+            format!("{}{}", relative_dir, std::path::MAIN_SEPARATOR)
         };
-        // Use the safe retain_files method which maintains both indices
-        let arena = self.arena_base_ptr();
-        self.sync_data.retain_files(|file| {
+
+        self.sync_data.retain_files_with_arena(|file, arena| {
             !file.relative_path_starts_with(arena, &dir_prefix)
-                && !file.relative_path_eq(arena, &dir_rel)
         })
     }
 
@@ -1202,6 +1190,11 @@ impl FilePicker {
         if let Some(mut watcher) = self.background_watcher.take() {
             watcher.stop();
         }
+    }
+
+    #[inline]
+    pub(crate) fn arena_base_ptr(&self) -> ArenaPtr {
+        self.sync_data.arena_base_ptr()
     }
 
     /// Spawn a background thread to rebuild the bigram index after rescan.
@@ -1934,10 +1927,7 @@ fn walk_filesystem(
         files.par_sort_unstable_by(|a, b| {
             a.parent_dir_index()
                 .cmp(&b.parent_dir_index())
-                .then_with(|| {
-                    a.file_name_from_arena(arena)
-                        .cmp(&b.file_name_from_arena(arena))
-                })
+                .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
         });
     });
 

@@ -226,10 +226,10 @@ impl GrepFormatter<'_> {
         let mut content_first_file = String::new();
         for fm in &file_preview {
             if content_first_file.is_empty() {
-                content_first_file = picker.relative_path(fm.file);
+                content_first_file = fm.file.relative_path(picker);
             }
             if content_def_file.is_empty() && fm.is_definition {
-                content_def_file = picker.relative_path(fm.file);
+                content_def_file = fm.file.relative_path(picker);
             }
         }
 
@@ -284,7 +284,7 @@ impl GrepFormatter<'_> {
             let file = files[m.file_index];
             let mut match_lines: Vec<String> = Vec::new();
 
-            let file_rel_path = picker.relative_path(file);
+            let file_rel_path = file.relative_path(picker);
             if file_rel_path != current_file {
                 current_file = file_rel_path;
                 match_lines.push(current_file.to_string());
@@ -333,7 +333,7 @@ impl GrepFormatter<'_> {
             }
 
             // Auto-expand definitions with body context
-            let file_rel_for_expand = picker.relative_path(file);
+            let file_rel_for_expand = file.relative_path(picker);
             if auto_expand_defs
                 && !show_context
                 && m.is_definition
@@ -396,10 +396,10 @@ fn format_files_with_matches(
     let mut first_file = String::new();
     for fm in &file_map {
         if first_file.is_empty() {
-            first_file = picker.relative_path(fm.file);
+            first_file = fm.file.relative_path(picker);
         }
         if first_def_file.is_empty() && fm.is_definition {
-            first_def_file = picker.relative_path(fm.file);
+            first_def_file = fm.file.relative_path(picker);
         }
     }
     let suggest_path = if !first_def_file.is_empty() {
@@ -433,7 +433,7 @@ fn format_files_with_matches(
         let def_tag = if is_def { " [def]" } else { "" };
         lines.push(format!(
             "{}{}{}",
-            picker.relative_path(fm.file),
+            fm.file.relative_path(picker),
             def_tag,
             size_tag(fm.file.size)
         ));
@@ -504,7 +504,8 @@ fn format_count(
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for m in items {
-        let path = picker.relative_path(files[m.file_index]);
+        let file = files[m.file_index];
+        let path = file.relative_path(picker);
         let count = counts.entry(path.to_string()).or_insert_with(|| {
             order.push(path.to_string());
             0
@@ -532,7 +533,7 @@ fn collect_file_preview<'a>(
     let mut seen = std::collections::HashSet::new();
     for m in items {
         let file = files[m.file_index];
-        if seen.insert(picker.relative_path(file)) {
+        if seen.insert(file.relative_path(picker)) {
             file_preview.push(FileMeta {
                 file,
                 line_number: m.line_number,

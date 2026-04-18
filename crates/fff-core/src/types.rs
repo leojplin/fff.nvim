@@ -8,6 +8,36 @@ use crate::query_tracker::QueryMatchEntry;
 use crate::simd_path::{ArenaPtr, PATH_BUF_SIZE};
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
 
+/// Different sources of the string storage used by FFF
+/// implements as a deduplicated 16-bytes alined heap
+/// can be stored in RAM or on disk
+pub trait FFFStringStorage {
+    /// Resolve the arena for a [`FileItem`] (handles base vs overflow split).
+    fn arena_for(&self, file: &FileItem) -> ArenaPtr;
+
+    /// The base arena (scan-time paths).
+    fn base_arena(&self) -> ArenaPtr;
+    /// The overflow arena (paths added after the last full scan).
+    fn overflow_arena(&self) -> ArenaPtr;
+}
+
+impl FFFStringStorage for ArenaPtr {
+    #[inline]
+    fn arena_for(&self, _file: &FileItem) -> ArenaPtr {
+        *self
+    }
+
+    #[inline]
+    fn base_arena(&self) -> ArenaPtr {
+        *self
+    }
+
+    #[inline]
+    fn overflow_arena(&self) -> ArenaPtr {
+        *self
+    }
+}
+
 /// Cached file contents — mmap on Unix, heap buffer on Windows.
 ///
 /// On Windows, memory-mapped files hold the file handle open and prevent
@@ -47,15 +77,27 @@ impl FileItemFlags {
     pub const OVERFLOW: u8 = 1 << 2;
 }
 
+pub struct DirFlags;
+
+impl DirFlags {
+    pub const OVERFLOW: u8 = 1 << 0;
+}
+
 /// A directory in the file index. Shares chunk arena with file paths.
 #[derive(Debug, Clone)]
 pub struct DirItem {
+    flags: u8,
     pub(crate) path: crate::simd_path::ChunkedString,
 }
 
 impl DirItem {
+    #[inline(always)]
+    pub fn is_overflow(&self) -> bool {
+        self.flags & DirFlags::OVERFLOW == 0
+    }
+
     pub(crate) fn new(path: crate::simd_path::ChunkedString) -> Self {
-        Self { path }
+        Self { path, flags: 0 }
     }
 
     pub(crate) fn read_relative_path<'a>(&self, arena: ArenaPtr, buf: &'a mut [u8]) -> &'a str {
@@ -63,14 +105,20 @@ impl DirItem {
     }
 
     /// Relative dir path as owned String (cold path).
-    pub fn relative_path(&self, arena: ArenaPtr) -> String {
+    pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
-        self.path.write_to_string(arena, &mut out);
+        let ptr = if self.is_overflow() {
+            arena.overflow_arena()
+        } else {
+            arena.base_arena()
+        };
+
+        self.path.write_to_string(ptr, &mut out);
         out
     }
 
     /// A path = base_path + "/" + relative. Cold path, allocates.
-    pub fn absolute_path(&self, arena: ArenaPtr, base_path: &Path) -> PathBuf {
+    pub fn absolute_path(&self, arena: impl FFFStringStorage, base_path: &Path) -> PathBuf {
         let rel = self.relative_path(arena);
         if rel.is_empty() {
             base_path.to_path_buf()
@@ -140,9 +188,9 @@ impl FileItem {
     }
 
     /// Returns an absolute path of the file
-    pub fn absolute_path(&self, arena: ArenaPtr, base_path: &Path) -> PathBuf {
+    pub fn absolute_path(&self, arena: impl FFFStringStorage, base_path: &Path) -> PathBuf {
         let mut buf = [0u8; PATH_BUF_SIZE];
-        let rel = self.path.read_to_buf(arena, &mut buf);
+        let rel = self.path.read_to_buf(arena.arena_for(self), &mut buf);
         base_path.join(rel)
     }
 
@@ -158,9 +206,9 @@ impl FileItem {
         self.parent_dir = idx;
     }
 
-    pub(crate) fn dir_str(&self, arena: ArenaPtr) -> String {
+    pub fn dir_str(&self, arena: impl FFFStringStorage) -> String {
         let mut s = String::with_capacity(64);
-        self.path.write_dir_to(arena, &mut s);
+        self.path.write_dir_to(arena.arena_for(self), &mut s);
         s
     }
 
@@ -168,9 +216,9 @@ impl FileItem {
         self.path.write_dir_to(arena, out);
     }
 
-    pub(crate) fn file_name_from_arena(&self, arena: ArenaPtr) -> String {
+    pub fn file_name(&self, arena: impl FFFStringStorage) -> String {
         let mut s = String::with_capacity(32);
-        self.path.write_filename_to(arena, &mut s);
+        self.path.write_filename_to(arena.arena_for(self), &mut s);
         s
     }
 
@@ -178,9 +226,9 @@ impl FileItem {
         self.path.write_filename_to(arena, out);
     }
 
-    pub(crate) fn relative_path_from_arena(&self, arena: ArenaPtr) -> String {
+    pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut s = String::with_capacity(64);
-        self.path.write_to_string(arena, &mut s);
+        self.path.write_to_string(arena.arena_for(self), &mut s);
         s
     }
 

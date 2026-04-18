@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "  {}. {} ({})",
                     i + 1,
-                    picker.relative_path(file),
+                    file.relative_path(picker),
                     format_git_status(file.git_status)
                 );
             }
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let files = picker.get_files();
                 let newest_files = files.iter().rev().take(added.min(3));
                 for file in newest_files {
-                    println!("   ➕ {}", picker.relative_path(file));
+                    println!("   ➕ {}", file.relative_path(picker));
                 }
             } else {
                 let removed = last_count - current_count;
@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "   {}. {} (score: {})",
                     i + 1,
-                    picker_ref.relative_path(file),
+                    file.relative_path(picker_ref),
                     score.total
                 );
             }

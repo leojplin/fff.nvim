@@ -304,7 +304,7 @@ impl FffServer {
                 let mut current_file = String::new();
                 for m in fuzzy_result.matches.iter().take(3) {
                     let file = fuzzy_result.files[m.file_index];
-                    let file_rel = picker.relative_path(file);
+                    let file_rel = file.relative_path(picker);
                     if file_rel != current_file {
                         current_file = file_rel;
                         lines.push(current_file.to_string());
@@ -340,7 +340,7 @@ impl FffServer {
                     if score.base_score > query_len * 10 {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "0 content matches. But there is a relevant file path: {}",
-                            picker.relative_path(top)
+                            top.relative_path(picker)
                         ))]));
                     }
                 }
@@ -457,12 +457,12 @@ impl FffServer {
             if is_exact_match {
                 lines.push(format!(
                     "→ Read {} (exact match!)",
-                    picker.relative_path(top_item)
+                    top_item.relative_path(picker)
                 ));
             } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
                 lines.push(format!(
                     "→ Read {} (best match — Read this file directly)",
-                    picker.relative_path(top_item)
+                    top_item.relative_path(picker)
                 ));
             }
         }
@@ -477,7 +477,7 @@ impl FffServer {
         for item in &items {
             lines.push(format!(
                 "{}{}",
-                picker.relative_path(item),
+                item.relative_path(picker),
                 file_suffix(item.git_status, item.total_frecency_score())
             ));
         }

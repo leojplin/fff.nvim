@@ -291,7 +291,7 @@ fn plain_text_binary_files_are_skipped() {
     let has_binary = picker
         .get_files()
         .iter()
-        .any(|f| picker.relative_path(f).contains("binary.png") && f.is_binary());
+        .any(|f| f.relative_path(&picker).contains("binary.png") && f.is_binary());
     assert!(has_binary, "binary.png should be detected as binary");
 
     let parsed = parse_grep_query("match this text");
@@ -299,7 +299,7 @@ fn plain_text_binary_files_are_skipped() {
 
     // Only the text file should be searched, not the binary one
     assert_eq!(result.files.len(), 1);
-    assert!(picker.relative_path(result.files[0]).contains("text.txt"));
+    assert!(result.files[0].relative_path(&picker).contains("text.txt"));
 }
 
 #[test]
@@ -748,9 +748,9 @@ fn grep_with_extension_constraint() {
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            picker.relative_path(file).ends_with(".rs"),
+            file.relative_path(&picker).ends_with(".rs"),
             "should only match .rs files, got: {}",
-            picker.relative_path(file)
+            file.relative_path(&picker)
         );
     }
     assert!(
@@ -864,7 +864,7 @@ fn grep_with_path_constraint() {
     let result = picker.grep(&parsed, &plain_opts());
 
     assert_eq!(result.matches.len(), 1);
-    assert!(picker.relative_path(result.files[0]).starts_with("src/"));
+    assert!(result.files[0].relative_path(&picker).starts_with("src/"));
 }
 
 // ── Negated constraint tests ───────────────────────────────────────────
@@ -892,9 +892,9 @@ fn grep_with_negated_extension_constraint() {
         result.matches.len()
     );
     assert!(
-        picker.relative_path(result.files[0]).ends_with(".ts"),
+        result.files[0].relative_path(&picker).ends_with(".ts"),
         "should only match .ts file, got: {}",
-        picker.relative_path(result.files[0])
+        result.files[0].relative_path(&picker)
     );
 }
 
@@ -921,9 +921,9 @@ fn grep_with_negated_path_constraint() {
         result.matches.len()
     );
     assert!(
-        picker.relative_path(result.files[0]).starts_with("tests/"),
+        result.files[0].relative_path(&picker).starts_with("tests/"),
         "should only match tests/ file, got: {}",
-        picker.relative_path(result.files[0])
+        result.files[0].relative_path(&picker)
     );
 }
 
@@ -952,9 +952,9 @@ fn grep_with_negated_text_constraint() {
     );
     for file in &result.files {
         assert!(
-            !picker.relative_path(file).contains("test"),
+            !file.relative_path(&picker).contains("test"),
             "should not match files with 'test' in path, got: {}",
-            picker.relative_path(file)
+            file.relative_path(&picker)
         );
     }
 }
@@ -1208,9 +1208,9 @@ fn fuzzy_with_extension_constraint() {
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            picker.relative_path(file).ends_with(".rs"),
+            file.relative_path(&picker).ends_with(".rs"),
             "should only match .rs files, got: {}",
-            picker.relative_path(file)
+            file.relative_path(&picker)
         );
     }
 }

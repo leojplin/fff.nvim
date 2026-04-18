@@ -38,9 +38,8 @@ impl IntoLua for LuaPosition {
 
 fn file_item_into_lua(item: &FileItem, lua: &Lua, picker: &FilePicker) -> LuaResult<LuaValue> {
     let table = lua.create_table()?;
-    let rel_path = picker.relative_path(item);
-    table.set("relative_path", rel_path)?;
-    table.set("name", picker.file_name(item))?;
+    table.set("relative_path", item.relative_path(picker))?;
+    table.set("name", item.file_name(picker))?;
     table.set("size", item.size)?;
     table.set("modified", item.modified)?;
     table.set("access_frecency_score", item.access_frecency_score)?;
@@ -126,9 +125,8 @@ impl IntoLua for GrepResultLua<'_> {
 
             // File metadata from the deduplicated files vec
             let file = self.inner.files[m.file_index];
-            let rel_path = self.picker.relative_path(file);
-            item.set("relative_path", rel_path)?;
-            item.set("name", self.picker.file_name(file))?;
+            item.set("relative_path", file.relative_path(self.picker))?;
+            item.set("name", file.file_name(self.picker))?;
             item.set("is_binary", file.is_binary())?;
             item.set("git_status", format_git_status(file.git_status))?;
             item.set("size", file.size)?;

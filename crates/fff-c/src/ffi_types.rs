@@ -74,10 +74,9 @@ pub struct FffFileItem {
 
 impl FffFileItem {
     pub fn from_item(item: &FileItem, picker: &FilePicker) -> Self {
-        let rel_path = picker.relative_path(item);
         FffFileItem {
-            relative_path: cstring_new(&rel_path),
-            file_name: cstring_new(&picker.file_name(item)),
+            relative_path: cstring_new(&item.relative_path(picker)),
+            file_name: cstring_new(&item.file_name(picker)),
             git_status: cstring_new(format_git_status(item.git_status)),
             size: item.size,
             modified: item.modified,
@@ -309,10 +308,9 @@ impl FffGrepMatch {
             None => (false, 0),
         };
 
-        let rel_path = picker.relative_path(file);
         FffGrepMatch {
-            relative_path: cstring_new(&rel_path),
-            file_name: cstring_new(&picker.file_name(file)),
+            relative_path: cstring_new(&file.relative_path(picker)),
+            file_name: cstring_new(&file.file_name(picker)),
             git_status: cstring_new(format_git_status(file.git_status)),
             line_content: cstring_new(&m.line_content),
             match_ranges,

@@ -687,9 +687,9 @@ mod tests {
         assert_eq!(scores[2].total, 200, "Third should be third highest");
 
         // Verify the files match
-        assert_eq!(items[0].relative_path_from_arena(arena), "file4.rs");
-        assert_eq!(items[1].relative_path_from_arena(arena), "file6.rs");
-        assert_eq!(items[2].relative_path_from_arena(arena), "file2.rs");
+        assert_eq!(items[0].relative_path(arena), "file4.rs");
+        assert_eq!(items[1].relative_path(arena), "file6.rs");
+        assert_eq!(items[2].relative_path(arena), "file2.rs");
     }
 
     #[test]
@@ -783,9 +783,9 @@ mod tests {
         assert_eq!(scores[0].total, 200);
         assert_eq!(scores[1].total, 100);
         assert_eq!(scores[2].total, 50);
-        assert_eq!(items[0].relative_path_from_arena(arena), "file2.rs");
-        assert_eq!(items[1].relative_path_from_arena(arena), "file1.rs");
-        assert_eq!(items[2].relative_path_from_arena(arena), "file3.rs");
+        assert_eq!(items[0].relative_path(arena), "file2.rs");
+        assert_eq!(items[1].relative_path(arena), "file1.rs");
+        assert_eq!(items[2].relative_path(arena), "file3.rs");
     }
 }
 
@@ -867,7 +867,7 @@ mod filename_bonus_tests {
         items
             .iter()
             .zip(scores.iter())
-            .map(|(f, s)| (f.relative_path_from_arena(arena).to_string(), s.clone()))
+            .map(|(f, s)| (f.relative_path(arena).to_string(), s.clone()))
             .collect()
     }
 
@@ -1084,10 +1084,7 @@ mod typo_resistance_tests {
             },
         };
         let (items, _, _) = fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
-        items
-            .iter()
-            .map(|f| f.relative_path_from_arena(arena))
-            .collect()
+        items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
     #[test]

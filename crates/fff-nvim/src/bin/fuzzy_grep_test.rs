@@ -65,7 +65,7 @@ fn run_fuzzy_query(picker: &FilePicker, query: &str, label: &str) {
         if m.file_index != current_file_idx {
             current_file_idx = m.file_index;
             let file = &result.files[m.file_index];
-            eprintln!("\n  ┌─ {}", picker.relative_path(file));
+            eprintln!("\n  ┌─ {}", file.relative_path(picker));
         }
 
         // Truncate long lines for display
