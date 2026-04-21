@@ -105,6 +105,10 @@ jobs:
         with:
           node-version: "25"
 
+      - name: Install node dependencies
+        shell: bash
+        run: cd packages/fff-node && npm install
+
       - name: Run node tests
         shell: bash
         run: make test-node

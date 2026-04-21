@@ -12,6 +12,11 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    zig-overlay = {
+      url = "github:mitchellh/zig-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -21,6 +26,7 @@
       crane,
       flake-utils,
       rust-overlay,
+      zig-overlay,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -30,6 +36,10 @@
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+
+        # zlob requires Zig >= 0.16, but nixpkgs tops out at 0.15. Pull from
+        # mitchellh/zig-overlay which ships every released version.
+        zig = zig-overlay.packages.${system}."0.16.0";
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -45,7 +55,7 @@
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
 
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.perl pkgs.zig pkgs.llvmPackages.libclang.lib ];
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.perl zig pkgs.llvmPackages.libclang.lib ];
           buildInputs = with pkgs; [
             # Add additional build inputs here
             openssl
