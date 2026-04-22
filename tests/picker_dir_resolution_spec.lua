@@ -9,18 +9,24 @@ local fff_rust = require('fff.rust')
 local picker_ui = require('fff.picker_ui')
 local file_picker = require('fff.file_picker')
 
+--- Normalise a path so that comparisons work on every OS (Windows Rust
+--- may return forward-slash paths while vim.fn.resolve uses backslashes).
+--- @param p string
+--- @return string
+local function norm(p) return vim.fs.normalize(vim.fn.resolve(p)) end
+
 --- `change_indexing_directory` swaps the picker on a background thread, so the
 --- `FILE_PICKER` global may still point at the *old* picker for a moment —
 --- `wait_for_initial_scan` on the old picker returns immediately and the
 --- search then runs against the new, still-empty index. Poll `health_check`
 --- until `base_path` matches the expected dir before waiting on the scan.
 local function wait_for_reindex(expected_dir, timeout_ms)
-  local expected = vim.fn.resolve(expected_dir)
+  local expected = norm(expected_dir)
   local deadline = vim.uv.hrtime() + timeout_ms * 1e6
   while vim.uv.hrtime() < deadline do
     local ok, health = pcall(fff_rust.health_check, expected)
     if ok and health and health.file_picker and health.file_picker.base_path then
-      if vim.fn.resolve(health.file_picker.base_path) == expected then return true end
+      if norm(health.file_picker.base_path) == expected then return true end
     end
     vim.wait(20, function() return false end)
   end
@@ -69,7 +75,7 @@ describe('picker find_files_in_dir path resolution (issue #389)', function()
   end)
 
   it(':edit opens the file inside base_path even when neovim cwd differs', function()
-    assert.are_not.equal(vim.fn.resolve(target_dir), vim.fn.resolve(vim.fn.getcwd()))
+    assert.are_not.equal(norm(target_dir), norm(vim.fn.getcwd()))
 
     assert.is_true(picker_ui.change_indexing_directory(target_dir))
     wait_for_scan(target_dir, 10000)
@@ -120,8 +126,8 @@ describe('picker find_files_in_dir path resolution (issue #389)', function()
 
     -- The opened file must be the fixture inside target_dir, not a phantom
     -- file under cwd.
-    local expected = vim.fn.resolve(target_dir .. '/' .. target_filename)
-    local actual = vim.fn.resolve(bufname)
+    local expected = norm(target_dir .. '/' .. target_filename)
+    local actual = norm(bufname)
     assert.are.equal(expected, actual)
   end)
 end)
