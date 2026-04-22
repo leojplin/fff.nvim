@@ -47,6 +47,12 @@ describe('picker find_files_in_dir path resolution (issue #389)', function()
     fd:write('-- issue #389 regression fixture\nreturn true\n')
     fd:close()
 
+    -- Clear the DirChanged autocmd that a previous test run (e.g. fff_core_spec)
+    -- may have installed.  Without this, the :cd below triggers a scheduled
+    -- change_indexing_directory(other_cwd) that races with our explicit
+    -- change_indexing_directory(target_dir) and overwrites the FILE_PICKER.
+    pcall(vim.api.nvim_del_augroup_by_name, 'fff_file_tracking')
+
     vim.cmd('cd ' .. vim.fn.fnameescape(other_cwd))
     -- Equivalent to require('fff').setup({}) — just seeds vim.g.fff — but
     -- avoids the top-level fff module lookup which plenary's sandboxed
