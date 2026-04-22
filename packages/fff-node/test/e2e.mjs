@@ -134,10 +134,15 @@ describe("fff-node", { concurrency: 1 }, () => {
     it("finds FffResult in Rust sources", () => {
       // Constrain to .rs files so the assertion doesn't depend on result ordering
       // or content-indexing timing for other file types.
-      const r = finder.grep("*.rs FffResult", { mode: "plain" });
-      assert.ok(r.ok, `grep failed: ${!r.ok ? r.error : ""}`);
-      assert.ok(r.value.items.length > 0, "expected at least one .rs match");
-      assert.ok(r.value.items.some((m) => m.relativePath.endsWith(".rs")));
+      const rustResults = finder.grep("*.rs FffResult", { mode: "plain" });
+      assert.ok(rustResults.ok, `grep failed: ${!rustResults.ok ? rustResults.error : ""}`);
+      assert.ok(rustResults.value.items.length > 0, "expected at least one .rs match");
+      assert.ok(rustResults.value.items.some((m) => m.relativePath.endsWith(".rs")));
+
+      const cResults = finder.grep("!**/*.{js,ts,rs} FffResult", { mode: "plain" });
+      assert.ok(cResults.ok, `grep failed: ${!cResults.ok ? cResults.error : ""}`);
+      assert.ok(cResults.value.items.length > 0, "expected at least one non-js/ts/rs match");
+      assert.ok(cResults.value.items.some((m) => m.relativePath.endsWith(".h")));
     });
 
     it("match items contain all required fields", () => {
@@ -192,7 +197,9 @@ describe("fff-node", { concurrency: 1 }, () => {
           .map((m) => normalizePath(m.relativePath))
           .join(", ")}`,
       );
-      assert.deepEqual(match.contextBefore, ["  if (raw.context_before_count > 0) {"]);
+      assert.deepEqual(match.contextBefore, [
+        "  if (raw.context_before_count > 0) {",
+      ]);
       assert.deepEqual(match.contextAfter, ["  }"]);
     });
   });
@@ -219,11 +226,9 @@ describe("fff-node", { concurrency: 1 }, () => {
     assert.ok(r.value > 0);
   });
 
-
   it("isScanning returns a boolean", () => {
     assert.equal(typeof finder.isScanning(), "boolean");
   });
-
 
   describe("healthCheck", { concurrency: 1 }, () => {
     it("reports initialized state with instance", () => {
