@@ -102,6 +102,10 @@ impl<C: ParserConfig> QueryParser<C> {
         let tokens = query.split_whitespace();
 
         let mut has_file_path = false;
+        // Track the FilePath token position in constraints so we can promote
+        // it back to text if the final query ends up with no fuzzy text.
+        let mut file_path_constraint_idx: Option<usize> = None;
+        let mut file_path_token: Option<&str> = None;
         for token in tokens {
             match parse_token(token, config) {
                 Some(Constraint::FilePath(_)) => {
@@ -111,6 +115,8 @@ impl<C: ParserConfig> QueryParser<C> {
                         // searching for).
                         text_parts.push(token);
                     } else {
+                        file_path_constraint_idx = Some(constraints.len());
+                        file_path_token = Some(token);
                         constraints.push(Constraint::FilePath(token));
                         has_file_path = true;
                     }
@@ -122,6 +128,21 @@ impl<C: ParserConfig> QueryParser<C> {
                     text_parts.push(token);
                 }
             }
+        }
+
+        // If the query produced a single FilePath and no fuzzy text parts, the
+        // user isn't filtering by filename suffix — they're fuzzy-searching
+        // for that name (the only other constraints are path-scoping like
+        // PathSegment/Extension/Glob). Mirror the single-token rule at
+        // parser.rs:48-64: promote FilePath → fuzzy text so e.g. `profile.h`
+        // alongside `chrome/browser/profiles/` fuzzy-matches all `profile*.h`
+        // files instead of only one file literally ending in `/profile.h`.
+        if text_parts.is_empty()
+            && let Some(idx) = file_path_constraint_idx
+            && let Some(tok) = file_path_token
+        {
+            constraints.remove(idx);
+            text_parts.push(tok);
         }
 
         // Try to extract location from the last fuzzy token
@@ -917,6 +938,59 @@ mod tests {
     }
 
     #[test]
+    fn test_ai_grep_filename_with_pathsegment_only_promotes_to_text() {
+        // When the ONLY non-text constraints are path-scoping (PathSegment,
+        // here), a bare filename token like `profile.h` should NOT be used as
+        // a FilePath filter — the user is fuzzy-searching within that dir,
+        // not asking for files named exactly `profile.h`.
+        use crate::AiGrepConfig;
+        let parser = QueryParser::new(AiGrepConfig);
+        let result = parser.parse("chrome/browser/profiles/ profile.h");
+        assert_eq!(result.constraints.len(), 1);
+        assert!(
+            matches!(
+                result.constraints[0],
+                Constraint::PathSegment("chrome/browser/profiles")
+            ),
+            "Expected single PathSegment, got {:?}",
+            result.constraints
+        );
+        assert_eq!(result.grep_text(), "profile.h");
+    }
+
+    #[test]
+    fn test_ai_grep_filename_with_extension_only_promotes_to_text() {
+        // Same case with an Extension constraint — no fuzzy text means the
+        // filename is what the user is searching for.
+        use crate::AiGrepConfig;
+        let parser = QueryParser::new(AiGrepConfig);
+        let result = parser.parse("*.h profile.h");
+        assert_eq!(result.constraints.len(), 1);
+        assert!(
+            matches!(result.constraints[0], Constraint::Extension("h")),
+            "Expected Extension, got {:?}",
+            result.constraints
+        );
+        assert_eq!(result.grep_text(), "profile.h");
+    }
+
+    #[test]
+    fn test_ai_grep_filename_with_other_text_keeps_filepath() {
+        // Sanity: when there IS fuzzy text alongside the filename, the
+        // filename stays a FilePath filter (the documented multi-token case).
+        use crate::AiGrepConfig;
+        let parser = QueryParser::new(AiGrepConfig);
+        let result = parser.parse("main.rs pattern");
+        assert_eq!(result.constraints.len(), 1);
+        assert!(
+            matches!(result.constraints[0], Constraint::FilePath("main.rs")),
+            "Expected FilePath, got {:?}",
+            result.constraints
+        );
+        assert_eq!(result.grep_text(), "pattern");
+    }
+
+    #[test]
     fn test_ai_grep_bare_filename_schema_rs() {
         use crate::AiGrepConfig;
         let parser = QueryParser::new(AiGrepConfig);
@@ -1157,16 +1231,16 @@ mod tests {
     fn test_file_picker_filename_with_extension_constraint() {
         let parser = QueryParser::new(FileSearchConfig);
         let result = parser.parse("main.rs *.lua");
-        // main.rs → FilePath, *.lua → Extension
-        assert_eq!(result.constraints.len(), 2);
+        // With only path-scoping constraints (Extension) and no fuzzy text,
+        // `main.rs` is promoted to fuzzy text — the user is fuzzy-searching
+        // for "main.rs" among `.lua` files, not filtering by literal filename
+        // suffix. Only the Extension constraint remains.
+        assert_eq!(result.constraints.len(), 1);
         assert!(matches!(
             result.constraints[0],
-            Constraint::FilePath("main.rs")
-        ));
-        assert!(matches!(
-            result.constraints[1],
             Constraint::Extension("lua")
         ));
+        assert_eq!(result.fuzzy_query, FuzzyQuery::Text("main.rs"));
     }
 
     #[test]
