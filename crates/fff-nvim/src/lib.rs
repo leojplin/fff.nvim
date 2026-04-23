@@ -67,7 +67,10 @@ pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
     Ok(QUERY_TRACKER.destroy().into_lua_result()?.is_some())
 }
 
-pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
+pub fn init_file_picker(
+    _: &Lua,
+    (base_path, watch_git_events): (String, Option<bool>),
+) -> LuaResult<bool> {
     {
         let guard = FILE_PICKER.read().into_lua_result()?;
         if guard.is_some() {
@@ -83,6 +86,7 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            watch_git_events: watch_git_events.unwrap_or(true),
             ..Default::default()
         },
     )
@@ -92,12 +96,24 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
 }
 
 fn reinit_file_picker_internal(path: &Path) -> Result<(), Error> {
+    let mut warmup_caches = true;
+    let mut content_indexing = true;
+    let mut watch = true;
+    let mut watch_git_events = true;
+    let mut mode = FFFMode::Neovim;
+
     // Cancel and stop the old picker under a single write lock to avoid
     // a window where FILE_PICKER is None (which causes FilePickerMissing
     // errors if the UI is searching concurrently).
     {
         let mut guard = FILE_PICKER.write()?;
         if let Some(ref mut picker) = *guard {
+            warmup_caches = picker.need_enable_mmap_cache();
+            content_indexing = picker.need_enable_content_indexing();
+            watch = picker.need_watch();
+            watch_git_events = picker.need_watch_git_events();
+            mode = picker.mode();
+
             // Signal cancellation BEFORE stopping — this tells any orphaned
             // scan threads from this picker to discard their results.
             picker.cancel();
@@ -113,9 +129,11 @@ fn reinit_file_picker_internal(path: &Path) -> Result<(), Error> {
         FRECENCY.clone(),
         fff::FilePickerOptions {
             base_path: path.to_string_lossy().to_string(),
-            enable_mmap_cache: true,
-            enable_content_indexing: true,
-            mode: FFFMode::Neovim,
+            enable_mmap_cache: warmup_caches,
+            enable_content_indexing: content_indexing,
+            mode,
+            watch,
+            watch_git_events,
             ..Default::default()
         },
     )?;

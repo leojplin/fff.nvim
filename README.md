@@ -248,6 +248,7 @@ require('fff').setup({
   },
   git = {
     status_text_color = false, -- true to color filenames by git status
+    watch_git_events = true, -- false to ignore .git watcher events for status refreshes
   },
   grep = {
     max_file_size = 10 * 1024 * 1024,
@@ -300,7 +301,7 @@ Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
 
 ### Git status highlighting
 
-Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
+Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. If heavy git operations cause too much churn, set `git.watch_git_events = false` to stop `.git` watcher events from triggering refreshes. See `:help fff.nvim` for the full list.
 
 ### File filtering
 

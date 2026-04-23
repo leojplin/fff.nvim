@@ -314,6 +314,7 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      watch_git_events = true, -- Refresh git status from .git watcher events (disable if git operations cause too much churn)
     },
     debug = {
       enabled = false, -- Show file info panel in preview

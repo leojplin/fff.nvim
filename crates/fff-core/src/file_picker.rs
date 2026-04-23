@@ -407,6 +407,8 @@ pub struct FilePickerOptions {
     pub cache_budget: Option<ContentCacheBudget>,
     /// When `false`, `new_with_shared_state` skips the background file watcher.
     pub watch: bool,
+    /// When `false`, .git watcher events do not trigger git-status refreshes.
+    pub watch_git_events: bool,
 }
 
 impl Default for FilePickerOptions {
@@ -418,6 +420,7 @@ impl Default for FilePickerOptions {
             mode: FFFMode::default(),
             cache_budget: None,
             watch: true,
+            watch_git_events: true,
         }
     }
 }
@@ -435,6 +438,7 @@ pub struct FilePicker {
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
+    watch_git_events: bool,
     cancelled: Arc<AtomicBool>,
     // This is a soft lock that we use to prevent rescan be triggered while the
     // bigram indexing is in progress. This allows to keep some of the unsafe magic
@@ -501,6 +505,10 @@ impl FilePicker {
 
     pub fn need_watch(&self) -> bool {
         self.watch
+    }
+
+    pub fn need_watch_git_events(&self) -> bool {
+        self.watch_git_events
     }
 
     pub fn mode(&self) -> FFFMode {
@@ -655,6 +663,7 @@ impl FilePicker {
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
+            watch_git_events: options.watch_git_events,
             watcher_ready: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -689,6 +698,7 @@ impl FilePicker {
         let cancelled = Arc::clone(&picker.cancelled);
         let post_scan_busy = Arc::clone(&picker.post_scan_busy);
         let path = picker.base_path.clone();
+        let watch_git_events = picker.watch_git_events;
 
         {
             let mut guard = shared_picker.write()?;
@@ -703,6 +713,7 @@ impl FilePicker {
             warmup,
             content_indexing,
             watch,
+            watch_git_events,
             mode,
             shared_picker,
             shared_frecency,
@@ -776,6 +787,7 @@ impl FilePicker {
             shared_frecency.clone(),
             self.mode,
             watch_dirs,
+            self.watch_git_events,
         )?;
         self.background_watcher = Some(watcher);
         self.watcher_ready.store(true, Ordering::Release);
@@ -1658,6 +1670,7 @@ fn spawn_scan_and_watcher(
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
+    watch_git_events: bool,
     mode: FFFMode,
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
@@ -1735,6 +1748,7 @@ fn spawn_scan_and_watcher(
                 shared_frecency.clone(),
                 mode,
                 watch_dirs,
+                watch_git_events,
             ) {
                 Ok(watcher) => {
                     info!("Background file watcher initialized successfully");

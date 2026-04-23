@@ -53,6 +53,7 @@ impl BackgroundWatcher {
         shared_frecency: SharedFrecency,
         mode: FFFMode,
         watch_dirs: Vec<PathBuf>,
+        watch_git_events: bool,
     ) -> Result<Self, Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
@@ -75,6 +76,7 @@ impl BackgroundWatcher {
             mode,
             watch_dirs,
             watch_tx,
+            watch_git_events,
         )?;
         info!("Background file watcher initialized successfully");
 
@@ -136,6 +138,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         watch_dirs: Vec<PathBuf>,
         watch_tx: mpsc::Sender<PathBuf>,
+        watch_git_events: bool,
     ) -> Result<Debouncer, Error> {
         let config = Config::default()
             // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
@@ -164,6 +167,7 @@ impl BackgroundWatcher {
                             &shared_picker,
                             &shared_frecency,
                             mode,
+                            watch_git_events,
                         );
 
                         // In NonRecursive mode, register watches for newly
@@ -240,14 +244,16 @@ impl BackgroundWatcher {
             );
         }
 
-        // The .git directory is excluded from the file list but we still need
-        // to observe changes that affect git status (staging, unstaging,
-        // committing, branch switches, merges, etc.).
-        // When using recursive mode the base watch already covers .git/,
-        // but these targeted watches are cheap (at most 3 extra streams)
-        // and ensure we catch status changes even if the recursive backend
-        // coalesces or delays .git events.
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        if watch_git_events {
+            // The .git directory is excluded from the file list but we still need
+            // to observe changes that affect git status (staging, unstaging,
+            // committing, branch switches, merges, etc.).
+            // When using recursive mode the base watch already covers .git/,
+            // but these targeted watches are cheap (at most 3 extra streams)
+            // and ensure we catch status changes even if the recursive backend
+            // coalesces or delays .git events.
+            watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        }
 
         Ok(debouncer)
     }
@@ -279,6 +285,7 @@ fn handle_debounced_events(
     shared_picker: &SharedPicker,
     shared_frecency: &SharedFrecency,
     mode: FFFMode,
+    watch_git_events: bool,
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
@@ -326,7 +333,7 @@ fn handle_debounced_events(
                 break;
             }
 
-            if is_dotgit_change_affecting_status(path, &repo) {
+            if watch_git_events && is_dotgit_change_affecting_status(path, &repo) {
                 need_full_git_rescan = true;
             }
 
