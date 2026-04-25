@@ -9,7 +9,8 @@ INCLUDEDIR ?= $(PREFIX)/include
 all: format test lint
 
 build:
-	cargo build --release --features zlob
+	cargo build --release --features zlob,daemon
+	cargo build --release -p fff-daemon
 
 build-c-lib:
 	cargo build --release -p fff-c --features zlob

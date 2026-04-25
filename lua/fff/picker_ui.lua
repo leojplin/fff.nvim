@@ -1213,25 +1213,31 @@ function M.update_results_sync()
   M.state.filtered_items = results
 
   -- Cross-mode suggestions: when primary search yields 0 results with a non-empty query,
-  -- query the opposite mode and store results as suggestions.
+  -- optionally query the opposite mode and store those results as suggestions.
+  local suggestions_config = M.state.config.suggestions or {}
+  local allow_file_to_grep = suggestions_config.file_to_grep ~= false
+  local allow_grep_to_files = suggestions_config.grep_to_files ~= false
+
   M.state.suggestion_items = nil
   M.state.suggestion_source = nil
   if #results == 0 and M.state.query ~= '' then
     if M.state.mode == 'grep' then
-      -- Grep returned nothing — try file search as suggestion
-      local suggestion_results = file_picker.search_files_paginated(
-        M.state.query,
-        M.state.current_file_cache,
-        M.state.config.max_threads,
-        nil,
-        0,
-        page_size
-      )
-      if suggestion_results and #suggestion_results > 0 then
-        M.state.suggestion_items = suggestion_results
-        M.state.suggestion_source = 'files'
+      if allow_grep_to_files then
+        -- Grep returned nothing — try file search as suggestion
+        local suggestion_results = file_picker.search_files_paginated(
+          M.state.query,
+          M.state.current_file_cache,
+          M.state.config.max_threads,
+          nil,
+          0,
+          page_size
+        )
+        if suggestion_results and #suggestion_results > 0 then
+          M.state.suggestion_items = suggestion_results
+          M.state.suggestion_source = 'files'
+        end
       end
-    else
+    elseif allow_file_to_grep then
       -- File search returned nothing — try grep as suggestion
       local grep = require('fff.grep')
       local grep_result = grep.search(M.state.query, 0, page_size, M.state.grep_config, 'plain')

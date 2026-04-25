@@ -88,7 +88,7 @@ jobs:
       - name: Build for Linux
         if: contains(matrix.os, 'ubuntu') && !contains(matrix.target, 'android')
         run: |
-          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --features zlob
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --features zlob,daemon
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for Android (Termux)
@@ -102,13 +102,13 @@ jobs:
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
 
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob,daemon
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for macOS
         if: contains(matrix.os, 'macos')
         run: |
-          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob,daemon
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Ad-hoc sign macOS binary
@@ -127,6 +127,95 @@ jobs:
         with:
           name: nvim-${{ matrix.target }}
           path: ${{ matrix.target }}.*
+
+  build-daemon:
+    name: Build Daemon ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          ## Linux builds (using cargo-zigbuild)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            zigbuild_target: x86_64-unknown-linux-gnu.2.31
+            artifact_name: target/x86_64-unknown-linux-gnu/ci/fff-daemon
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            zigbuild_target: aarch64-unknown-linux-gnu.2.31
+            artifact_name: target/aarch64-unknown-linux-gnu/ci/fff-daemon
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact_name: target/x86_64-unknown-linux-musl/ci/fff-daemon
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            artifact_name: target/aarch64-unknown-linux-musl/ci/fff-daemon
+
+          ## Android (Termux)
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact_name: target/aarch64-linux-android/ci/fff-daemon
+
+          ## macOS builds
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: target/x86_64-apple-darwin/ci/fff-daemon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: target/aarch64-apple-darwin/ci/fff-daemon
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: contains(matrix.os, 'ubuntu')
+        run: cargo install cargo-zigbuild
+
+      - name: Build for Linux
+        if: contains(matrix.os, 'ubuntu') && !contains(matrix.target, 'android')
+        run: |
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-daemon
+          cp "${{ matrix.artifact_name }}" "fff-daemon-${{ matrix.target }}"
+
+      - name: Build for Android (Termux)
+        if: contains(matrix.target, 'android')
+        run: |
+          NDK_BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
+          export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
+
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-daemon
+          cp "${{ matrix.artifact_name }}" "fff-daemon-${{ matrix.target }}"
+
+      - name: Build for macOS
+        if: contains(matrix.os, 'macos')
+        run: |
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-daemon
+          cp "${{ matrix.artifact_name }}" "fff-daemon-${{ matrix.target }}"
+
+      - name: Ad-hoc sign macOS binary
+        if: contains(matrix.os, 'macos')
+        run: codesign --force --sign - "fff-daemon-${{ matrix.target }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.target }}
+          path: fff-daemon-${{ matrix.target }}
 
   build-c:
     name: Build C FFI ${{ matrix.target }}
@@ -360,7 +449,7 @@ jobs:
 
   release:
     name: Release
-    needs: [build-nvim, build-c, build-mcp]
+    needs: [build-nvim, build-daemon, build-c, build-mcp]
     runs-on: ubuntu-latest
     # do not create releases on the forks (no permissions)
     if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'dmtrKovalenko'
@@ -420,6 +509,19 @@ jobs:
             rmdir "$dir" 2>/dev/null || true
           done
 
+      - name: Flatten Daemon artifacts
+        working-directory: ./binaries
+        run: |
+          for dir in daemon-*/; do
+            for file in "$dir"*; do
+              if [ -f "$file" ]; then
+                filename=$(basename "$file")
+                mv "$file" "./$filename"
+              fi
+            done
+            rmdir "$dir" 2>/dev/null || true
+          done
+
       - name: Remove npm package artifacts from release binaries
         working-directory: ./binaries
         run: |
@@ -454,6 +556,7 @@ jobs:
 
             ## Neovim Plugin
             - `{target}.so` / `.dylib` / `.dll` - Lua module for Neovim
+            - `fff-daemon-{target}` - Daemon binary (auto-downloaded by plugin)
 
             ## C FFI Library (for Bun/Node/Python)
             - `c-lib-{target}.so` / `.dylib` / `.dll` - C FFI library

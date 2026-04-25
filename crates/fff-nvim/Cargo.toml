@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 zlob = ["fff/zlob"]
+daemon = ["dep:fff-client", "dep:fff-protocol"]
 
 [[bin]]
 name = "test_watcher"
@@ -64,6 +65,8 @@ fff = { package = "fff-search", path = "../fff-core", version = "0.6.4", feature
 	"mimalloc-collect",
 ] }
 fff-query-parser = { path = "../fff-query-parser", version = "0.6.4" }
+fff-client = { path = "../fff-client", optional = true }
+fff-protocol = { path = "../fff-protocol", optional = true }
 
 # External dependencies
 blake3 = "1.8.2"

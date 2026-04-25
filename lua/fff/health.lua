@@ -100,6 +100,14 @@ function M.run(opts)
       name = nil,
       supports_directories = false,
     },
+    daemon = {
+      feature_compiled = false,
+      config_enabled = false,
+      backend_active = false,
+      binary_path = nil,
+      process_running = false,
+      pid = nil,
+    },
     messages = {},
   }
 
@@ -125,7 +133,13 @@ function M.run(opts)
     msg = 'Binary loaded successfully from: ' .. health.binary.path,
   })
 
-  local rust_health, rust_err = fetch_rust_checkhealth(rust_module, opts.test_path)
+  -- Use the daemon-aware dispatch (fff.fuzzy) when daemon mode is active,
+  -- otherwise fall back to the raw rust module.
+  local conf = require('fff.conf')
+  local config = conf.get()
+  local use_daemon = config.daemon and config.daemon.enabled and rust_module.daemon_available and rust_module.daemon
+  local health_fn_module = use_daemon and require('fff.fuzzy') or rust_module
+  local rust_health, rust_err = fetch_rust_checkhealth(health_fn_module, opts.test_path)
   if rust_health then
     health.rust.version = rust_health.version
     table.insert(health.messages, {
@@ -281,6 +295,143 @@ function M.run(opts)
       msg = rust_err or 'Unknown error getting rust health data',
     })
     return health
+  end
+
+  -- Daemon mode status
+  do
+    local conf = require('fff.conf')
+    local config = conf.get()
+    local daemon_enabled = config.daemon and config.daemon.enabled
+    health.daemon.config_enabled = daemon_enabled or false
+    health.daemon.feature_compiled = rust_module.daemon_available or false
+
+    -- Check daemon binary path
+    local daemon_bin = vim.env.FFF_DAEMON_BIN
+    health.daemon.binary_path = daemon_bin
+
+    -- Check if daemon process is running
+    if daemon_bin then
+      local result = vim.system({ 'pgrep', '-f', 'fff-daemon' }, { text = true }):wait()
+      if result.code == 0 and result.stdout and result.stdout ~= '' then
+        health.daemon.process_running = true
+        health.daemon.pid = vim.trim(vim.split(result.stdout, '\n')[1] or '')
+      end
+    end
+
+    -- Check which backend fuzzy.lua selected
+    local fuzzy_ok, fuzzy = pcall(require, 'fff.fuzzy')
+    if fuzzy_ok and daemon_enabled and rust_module.daemon_available and rust_module.daemon then
+      health.daemon.backend_active = true
+    end
+
+    -- Emit messages
+    if health.daemon.feature_compiled then
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Daemon feature compiled into binary',
+      })
+    else
+      table.insert(health.messages, {
+        level = 'info',
+        msg = 'Daemon feature not compiled (build with --features daemon to enable)',
+      })
+    end
+
+    if daemon_enabled then
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Daemon mode enabled in config',
+      })
+    else
+      table.insert(health.messages, {
+        level = 'info',
+        msg = 'Daemon mode disabled in config (set daemon.enabled = true to activate)',
+      })
+    end
+
+    if daemon_bin then
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Daemon binary found: ' .. daemon_bin,
+      })
+    else
+      if daemon_enabled then
+        table.insert(health.messages, {
+          level = 'warn',
+          msg = 'Daemon binary not found (FFF_DAEMON_BIN not set — build fff-daemon or check installation)',
+        })
+      end
+    end
+
+    if health.daemon.process_running then
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Daemon process running (pid ' .. health.daemon.pid .. ')',
+      })
+    else
+      if daemon_enabled and health.daemon.feature_compiled then
+        table.insert(health.messages, {
+          level = 'info',
+          msg = 'Daemon process not running (will auto-start on first file picker use)',
+        })
+      end
+    end
+
+    if health.daemon.backend_active then
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Active backend: daemon',
+      })
+
+      -- Show per-directory info from the daemon
+      local list_fn = rust_module.daemon and rust_module.daemon.list_directories
+      if list_fn then
+        local lok, dirs = pcall(list_fn)
+        if lok and dirs then
+          health.daemon.directories = dirs
+          if #dirs == 0 then
+            table.insert(health.messages, {
+              level = 'info',
+              msg = 'Daemon directory list is empty',
+            })
+          end
+          for _, dir in ipairs(dirs) do
+            local status = dir.is_scanning and 'scanning' or 'ready'
+            local pid_suffix = ''
+            if dir.client_pids and #dir.client_pids > 0 then
+              pid_suffix = string.format(', pids: %s', table.concat(dir.client_pids, ', '))
+            end
+            table.insert(health.messages, {
+              level = 'ok',
+              msg = string.format(
+                'Daemon directory: %s (%s, %d files, %d client%s%s)',
+                dir.path,
+                status,
+                dir.file_count,
+                dir.client_count,
+                dir.client_count == 1 and '' or 's',
+                pid_suffix
+              ),
+            })
+          end
+        else
+          table.insert(health.messages, {
+            level = 'warn',
+            msg = 'Failed to query daemon directories: ' .. tostring(dirs),
+          })
+        end
+      else
+        table.insert(health.messages, {
+          level = 'warn',
+          msg = 'Daemon backend missing list_directories() export',
+        })
+      end
+    else
+      table.insert(health.messages, {
+        level = 'ok',
+        msg = 'Active backend: in-process',
+      })
+    end
   end
 
   local image_info = check_image_preview()

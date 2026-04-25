@@ -13,6 +13,17 @@ local function get_binary_path(plugin_dir)
   return binary_dir .. '/libfff_nvim.' .. extension
 end
 
+local function get_daemon_binary_path(plugin_dir)
+  local binary_dir = get_binary_dir(plugin_dir)
+  return binary_dir .. '/fff-daemon'
+end
+
+local function daemon_binary_exists(plugin_dir)
+  local daemon_path = get_daemon_binary_path(plugin_dir)
+  local stat = vim.uv.fs_stat(daemon_path)
+  return stat and stat.type == 'file'
+end
+
 local function binary_exists(plugin_dir)
   local binary_path = get_binary_path(plugin_dir)
   local stat = vim.uv.fs_stat(binary_path)
@@ -80,6 +91,50 @@ local function download_file(url, output_path, opts, callback)
   end)
 end
 
+local function is_unix()
+  local sysname = vim.uv.os_uname().sysname:lower()
+  return sysname == 'darwin' or sysname == 'linux'
+end
+
+local function download_daemon_from_github(version, plugin_dir, opts, callback)
+  if not is_unix() then
+    callback(true, nil)
+    return
+  end
+
+  local triple = system.get_triple()
+  local daemon_name = 'fff-daemon-' .. triple
+  local url = string.format('https://github.com/%s/releases/download/%s/%s', GITHUB_REPO, version, daemon_name)
+  local daemon_path = get_daemon_binary_path(plugin_dir)
+  local tmp_path = daemon_path .. '.tmp'
+
+  download_file(url, tmp_path, {
+    proxy = opts.proxy,
+    extra_curl_args = opts.extra_curl_args,
+  }, function(success, err)
+    if not success then
+      vim.uv.fs_unlink(tmp_path)
+      -- Daemon download failure is non-fatal; in-process mode still works
+      vim.schedule(function()
+        vim.notify('fff.nvim: daemon binary not available (in-process mode will be used)', vim.log.levels.DEBUG)
+      end)
+      callback(true, nil)
+      return
+    end
+
+    -- Make executable
+    vim.uv.fs_chmod(tmp_path, 493) -- 0755
+    local rename_ok, rename_err = vim.uv.fs_rename(tmp_path, daemon_path)
+    if not rename_ok then
+      vim.uv.fs_unlink(tmp_path)
+      vim.schedule(function()
+        vim.notify('fff.nvim: failed to install daemon binary: ' .. (rename_err or 'unknown'), vim.log.levels.DEBUG)
+      end)
+    end
+    callback(true, nil)
+  end)
+end
+
 local function download_from_github(version, binary_path, opts, callback)
   opts = opts or {}
 
@@ -87,6 +142,7 @@ local function download_from_github(version, binary_path, opts, callback)
   local extension = system.get_lib_extension()
   local binary_name = triple .. '.' .. extension
   local url = string.format('https://github.com/%s/releases/download/%s/%s', GITHUB_REPO, version, binary_name)
+  local plugin_dir = vim.fn.fnamemodify(binary_path, ':h:h:h')
 
   vim.schedule(function()
     vim.notify(string.format('Downloading fff.nvim binary for ' .. version), vim.log.levels.INFO)
@@ -144,8 +200,13 @@ local function download_from_github(version, binary_path, opts, callback)
         return
       end
 
-      vim.notify('fff.nvim binary downloaded successfully!', vim.log.levels.INFO)
-      callback(true, nil)
+      -- Also download the daemon binary (Unix only, best-effort)
+      download_daemon_from_github(version, plugin_dir, opts, function()
+        vim.schedule(function()
+          vim.notify('fff.nvim binary downloaded successfully!', vim.log.levels.INFO)
+        end)
+        callback(true, nil)
+      end)
     end)
   end)
 end
@@ -154,7 +215,10 @@ function M.ensure_downloaded(opts, callback)
   opts = opts or {}
   local plugin_dir = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h')
 
-  if binary_exists(plugin_dir) and not opts.force then
+  local nvim_exists = binary_exists(plugin_dir)
+  local daemon_missing = is_unix() and not daemon_binary_exists(plugin_dir)
+
+  if nvim_exists and not daemon_missing and not opts.force then
     callback(true, nil)
     return
   end
@@ -223,12 +287,31 @@ function M.build_binary(callback)
     return
   end
 
-  vim.system({ 'cargo', 'build', '--release' }, { cwd = plugin_dir }, function(result)
+  -- Build the nvim module (with daemon support on Unix)
+  local build_cmd = { 'cargo', 'build', '--release', '-p', 'fff-nvim' }
+  if is_unix() then
+    table.insert(build_cmd, '--features')
+    table.insert(build_cmd, 'daemon')
+  end
+  vim.system(build_cmd, { cwd = plugin_dir }, function(result)
     if result.code ~= 0 then
       callback(false, 'Failed to build rust binary: ' .. (result.stderr or 'unknown error'))
       return
     end
-    callback(true, nil)
+
+    -- Also build the daemon binary on Unix (best-effort)
+    if is_unix() then
+      vim.system({ 'cargo', 'build', '--release', '-p', 'fff-daemon' }, { cwd = plugin_dir }, function(daemon_result)
+        if daemon_result.code ~= 0 then
+          vim.schedule(function()
+            vim.notify('fff.nvim: daemon build failed (in-process mode will be used)', vim.log.levels.WARN)
+          end)
+        end
+        callback(true, nil)
+      end)
+    else
+      callback(true, nil)
+    end
   end)
 end
 

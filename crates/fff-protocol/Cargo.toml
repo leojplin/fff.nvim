@@ -1,0 +1,10 @@
+[package]
+name = "fff-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "IPC protocol types for the fff daemon"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+libc = "0.2"

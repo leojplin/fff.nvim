@@ -42,6 +42,18 @@ if cargo_target_dir then
   table.insert(paths, cargo_target_dir .. '/release/?' .. get_lib_extension())
 end
 
+-- Set FFF_DAEMON_BIN so the Rust client can find the daemon binary
+-- next to the loaded shared library, without the user putting it on PATH.
+local function set_daemon_bin_env(lib_path)
+  local lib_dir = vim.fn.fnamemodify(lib_path, ':h')
+  local daemon_name = 'fff-daemon'
+  local daemon_path = lib_dir .. '/' .. daemon_name
+  local stat = vim.uv.fs_stat(daemon_path)
+  if stat and stat.type == 'file' then
+    vim.env.FFF_DAEMON_BIN = daemon_path
+  end
+end
+
 -- Instead of using require (which can find the wrong lib due to cpath pollution),
 -- load the library directly from the first valid path we find
 local function try_load_library()
@@ -51,7 +63,10 @@ local function try_load_library()
     if stat and stat.type == 'file' then
       local loader, err = package.loadlib(actual_path, 'luaopen_fff_nvim')
       if err then return nil, string.format('Error loading library from %s: %s', actual_path, err) end
-      if loader then return loader() end
+      if loader then
+        set_daemon_bin_env(actual_path)
+        return loader()
+      end
     end
   end
   return nil, 'No valid library found in any search path'

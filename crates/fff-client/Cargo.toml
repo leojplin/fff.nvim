@@ -1,0 +1,11 @@
+[package]
+name = "fff-client"
+version = "0.1.0"
+edition = "2021"
+description = "Client library for connecting to the fff daemon"
+
+[dependencies]
+fff-protocol = { path = "../fff-protocol" }
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"

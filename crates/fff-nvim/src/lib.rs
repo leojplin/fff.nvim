@@ -22,6 +22,10 @@ mod log;
 mod lua_types;
 mod path_shortening;
 
+#[cfg(feature = "daemon")]
+#[allow(dead_code)]
+mod daemon_mode;
+
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -864,6 +868,110 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     exports.set("hex_dump", lua.create_function(hex_dump::hex_dump)?)?;
     exports.set("parse_grep_query", lua.create_function(parse_grep_query)?)?;
 
+    #[cfg(feature = "daemon")]
+    exports.set("daemon_available", true)?;
+    #[cfg(not(feature = "daemon"))]
+    exports.set("daemon_available", false)?;
+
+    Ok(exports)
+}
+
+#[cfg(feature = "daemon")]
+fn create_daemon_exports(lua: &Lua) -> LuaResult<LuaTable> {
+    let exports = lua.create_table()?;
+    exports.set("init_db", lua.create_function(daemon_mode::init_db)?)?;
+    exports.set(
+        "destroy_frecency_db",
+        lua.create_function(daemon_mode::destroy_frecency_db)?,
+    )?;
+    exports.set(
+        "init_file_picker",
+        lua.create_function(daemon_mode::init_file_picker)?,
+    )?;
+    exports.set(
+        "restart_index_in_path",
+        lua.create_function(daemon_mode::restart_index_in_path)?,
+    )?;
+    exports.set("scan_files", lua.create_function(daemon_mode::scan_files)?)?;
+    exports.set(
+        "fuzzy_search_files",
+        lua.create_function(daemon_mode::fuzzy_search_files)?,
+    )?;
+    exports.set("live_grep", lua.create_function(daemon_mode::live_grep)?)?;
+    exports.set(
+        "track_access",
+        lua.create_function(daemon_mode::track_access)?,
+    )?;
+    exports.set(
+        "cancel_scan",
+        lua.create_function(daemon_mode::cancel_scan)?,
+    )?;
+    exports.set(
+        "get_scan_progress",
+        lua.create_function(daemon_mode::get_scan_progress)?,
+    )?;
+    exports.set(
+        "refresh_git_status",
+        lua.create_function(daemon_mode::refresh_git_status)?,
+    )?;
+    exports.set(
+        "get_git_root",
+        lua.create_function(daemon_mode::get_git_root)?,
+    )?;
+    exports.set(
+        "get_base_path",
+        lua.create_function(daemon_mode::get_base_path)?,
+    )?;
+    exports.set(
+        "stop_background_monitor",
+        lua.create_function(daemon_mode::stop_background_monitor)?,
+    )?;
+    // init_tracing stays local — daemon has its own tracing
+    exports.set("init_tracing", lua.create_function(init_tracing)?)?;
+    exports.set(
+        "wait_for_initial_scan",
+        lua.create_function(daemon_mode::wait_for_initial_scan)?,
+    )?;
+    exports.set(
+        "cleanup_file_picker",
+        lua.create_function(daemon_mode::cleanup_file_picker)?,
+    )?;
+    exports.set(
+        "destroy_query_db",
+        lua.create_function(daemon_mode::destroy_query_db)?,
+    )?;
+    exports.set(
+        "track_query_completion",
+        lua.create_function(daemon_mode::track_query_completion)?,
+    )?;
+    exports.set(
+        "get_historical_query",
+        lua.create_function(daemon_mode::get_historical_query)?,
+    )?;
+    exports.set(
+        "track_grep_query",
+        lua.create_function(daemon_mode::track_grep_query)?,
+    )?;
+    exports.set(
+        "get_historical_grep_query",
+        lua.create_function(daemon_mode::get_historical_grep_query)?,
+    )?;
+    exports.set(
+        "health_check",
+        lua.create_function(daemon_mode::health_check)?,
+    )?;
+    // shorten_path and hex_dump are local utilities — no daemon needed
+    exports.set("shorten_path", lua.create_function(shorten_path)?)?;
+    exports.set("hex_dump", lua.create_function(hex_dump::hex_dump)?)?;
+    exports.set(
+        "parse_grep_query",
+        lua.create_function(daemon_mode::parse_grep_query)?,
+    )?;
+    exports.set(
+        "list_directories",
+        lua.create_function(daemon_mode::list_directories)?,
+    )?;
+    exports.set("daemon_available", true)?;
     Ok(exports)
 }
 
@@ -874,5 +982,13 @@ fn fff_nvim(lua: &Lua) -> LuaResult<LuaTable> {
     // This ensures any panics are logged even if init_tracing is never called
     crate::log::install_panic_hook();
 
-    create_exports(lua)
+    let exports = create_exports(lua)?;
+
+    #[cfg(feature = "daemon")]
+    {
+        let daemon_exports = create_daemon_exports(lua)?;
+        exports.set("daemon", daemon_exports)?;
+    }
+
+    Ok(exports)
 }

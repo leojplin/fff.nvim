@@ -56,6 +56,13 @@ local M = {}
 --- @field modes string[]
 --- @field trim_whitespace boolean
 
+--- @class FffSuggestionsConfig
+--- @field file_to_grep boolean Show grep suggestions when file search has 0 results
+--- @field grep_to_files boolean Show file suggestions when grep search has 0 results
+
+--- @class FffDaemonConfig
+--- @field enabled boolean
+
 --- @class FffConfig
 --- @field base_path string
 --- @field prompt string
@@ -71,10 +78,12 @@ local M = {}
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
 --- @field git table
+--- @field daemon FffDaemonConfig
 --- @field debug table
 --- @field logging table
 --- @field file_picker table
 --- @field grep FffGrepConfig
+--- @field suggestions FffSuggestionsConfig
 
 ---@class fff.conf.State
 local state = {
@@ -316,6 +325,11 @@ local function init()
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
       watch_git_events = true, -- Refresh git status from .git watcher events (disable if git operations cause too much churn)
     },
+    -- Daemon mode: share a single file index across all Neovim instances.
+    -- Requires fff-nvim to be built with the "daemon" feature and fff-daemon to be installed.
+    daemon = {
+      enabled = false, -- Set to true to use the daemon for file search
+    },
     debug = {
       enabled = false, -- Show file info panel in preview
       show_scores = false, -- Show scores inline in the UI
@@ -337,6 +351,11 @@ local function init()
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+    },
+    -- Cross-mode suggestions shown when the primary mode has no results.
+    suggestions = {
+      file_to_grep = true, -- In file picker mode, show content matches as suggestions when path search returns 0 results.
+      grep_to_files = true, -- In grep mode, show file-name matches as suggestions when content search returns 0 results.
     },
   }
 

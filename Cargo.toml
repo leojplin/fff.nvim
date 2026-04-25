@@ -1,9 +1,12 @@
 [workspace]
 members = [
   "crates/fff-c",
+  "crates/fff-client",
   "crates/fff-core",
+  "crates/fff-daemon",
   "crates/fff-mcp",
   "crates/fff-nvim",
+  "crates/fff-protocol",
   "crates/fff-query-parser",
   "crates/fff-grep",
 ]

@@ -258,6 +258,10 @@ require('fff').setup({
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
   },
+  suggestions = {
+    file_to_grep = true,  -- file picker: show content matches when path search has 0 results
+    grep_to_files = true, -- grep picker: show file-name matches when content search has 0 results
+  },
   debug = { enabled = false, show_scores = false },
   logging = {
     enabled = true,
@@ -266,6 +270,8 @@ require('fff').setup({
   },
 })
 ```
+
+Set `suggestions.file_to_grep = false` if you want the file picker to stop falling back to content grep suggestions on zero-result queries.
 
 ### Live grep modes
 
