@@ -63,6 +63,20 @@ local M = {}
 --- @class FffDaemonConfig
 --- @field enabled boolean
 
+--- @class FffSelection
+--- @field path string Absolute (canonicalized) path of the selected item.
+--- @field relative_path string Path relative to cwd when possible; otherwise absolute.
+--- @field item table Raw picker item (includes line_number, col, etc. in grep mode).
+--- @field location table|nil Resolved jump location `{ line = number, col? = number }`.
+--- @field query string The active query at the moment of selection.
+--- @field mode string|nil 'grep' when invoked from live_grep, otherwise nil.
+
+--- Signature for the `on_select` hook.
+--- Return `true` to signal the hook fully handled the selection; fff will then
+--- skip its default `:edit`/`:split`/`:vsplit`/`:tabedit` and `jump_to_location`
+--- call. Return `false`/`nil` (or omit a return) to fall back to default behavior.
+--- @alias FffOnSelect fun(selection: FffSelection, action: 'edit'|'split'|'vsplit'|'tab'): boolean?
+
 --- @class FffConfig
 --- @field base_path string
 --- @field prompt string
@@ -84,6 +98,7 @@ local M = {}
 --- @field file_picker table
 --- @field grep FffGrepConfig
 --- @field suggestions FffSuggestionsConfig
+--- @field on_select FffOnSelect|nil
 
 ---@class fff.conf.State
 local state = {
@@ -357,6 +372,14 @@ local function init()
       file_to_grep = true, -- In file picker mode, show content matches as suggestions when path search returns 0 results.
       grep_to_files = true, -- In grep mode, show file-name matches as suggestions when content search returns 0 results.
     },
+    -- Optional hook: called when the user picks an item.
+    -- Signature: function(selection, action) -> boolean?
+    --   selection: { path, relative_path, item, location, query, mode }
+    --   action:    'edit'|'split'|'vsplit'|'tab'
+    -- Return `true` to suppress fff's default open/jump behavior (useful when
+    -- you want to open files in a specific window, send to a custom sink, etc.).
+    -- Return `false`/`nil` to fall through to fff's default handling.
+    on_select = nil,
   }
 
   local migrated_user_config = handle_deprecated_config(config)

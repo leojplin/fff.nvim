@@ -286,6 +286,7 @@ Defaults are sensible. Override only what you care about.
         file_to_grep = true,  -- file picker: show content matches when path search has 0 results
         grep_to_files = true, -- grep picker: show file-name matches when content search has 0 results
       },
+      on_select = nil, -- optional fun(selection, action): boolean?; see ON_SELECT
       debug = { enabled = false, show_scores = false },
       logging = {
         enabled = true,
@@ -298,6 +299,72 @@ Defaults are sensible. Override only what you care about.
 Set `suggestions.file_to_grep = false` if you want the file picker to stop
 falling back to content grep suggestions on zero-result queries.
 
+
+ON_SELECT HOOK								  *fff-on-select*
+
+The `on_select` config field lets you take over what happens when the user
+picks an item. It is invoked after the picker closes but before fff runs its
+default `:edit` / `:split` / `:vsplit` / `:tabedit` and `jump_to_location`
+call. Return `true` from the hook to fully handle the selection (fff will
+then skip its defaults). Return `false`/`nil` (or nothing) to let fff
+proceed normally after your hook runs.
+
+The hook receives two arguments:
+>lua
+    ---@param selection {
+    ---    path: string,          -- absolute (canonicalized) path
+    ---    relative_path: string, -- cwd-relative when possible, else absolute
+    ---    item: table,           -- raw picker item (line_number, col, ...)
+    ---    location: table|nil,   -- { line = N, col? = M } if resolvable
+    ---    query: string,         -- active query at selection time
+    ---    mode: string|nil,      -- 'grep' for live_grep, else nil
+    --- }
+    ---@param action 'edit'|'split'|'vsplit'|'tab'
+    ---@return boolean? handled  -- true => skip fff's default handling
+<
+
+Can be set globally via `setup({ on_select = ... })` or per-call by passing
+it in `opts` to `require('fff').find_files(opts)` or
+`require('fff').live_grep(opts)`.
+
+Example: always open the picked file in a specific, non-pinned window so
+`'winfixbuf'` windows don't trigger |E1513| :
+>lua
+    local function pick_target_win()
+      local cur = vim.api.nvim_get_current_win()
+      local function usable(win)
+        if not vim.api.nvim_win_is_valid(win) then return false end
+        local ok, fixed = pcall(vim.api.nvim_get_option_value,
+          'winfixbuf', { win = win })
+        if ok and fixed then return false end
+        local buf = vim.api.nvim_win_get_buf(win)
+        local bt = vim.api.nvim_get_option_value('buftype',     { buf = buf })
+        local md = vim.api.nvim_get_option_value('modifiable',  { buf = buf })
+        return (bt == '' or bt == 'acwrite') and md
+      end
+      if usable(cur) then return cur end
+      for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if usable(w) then return w end
+      end
+    end
+
+    require('fff').setup({
+      on_select = function(sel, action)
+        if action ~= 'edit' then return false end -- let fff handle splits/tabs
+        local target = pick_target_win()
+        if target then
+          vim.api.nvim_set_current_win(target)
+          vim.cmd('edit ' .. vim.fn.fnameescape(sel.relative_path))
+        else
+          vim.cmd('split ' .. vim.fn.fnameescape(sel.relative_path))
+        end
+        if sel.location then
+          require('fff.location_utils').jump_to_location(sel.location)
+        end
+        return true -- tell fff we handled it
+      end,
+    })
+<
 
 LIVE GREP MODES ~
 

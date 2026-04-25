@@ -262,6 +262,7 @@ require('fff').setup({
     file_to_grep = true,  -- file picker: show content matches when path search has 0 results
     grep_to_files = true, -- grep picker: show file-name matches when content search has 0 results
   },
+  on_select = nil, -- optional fun(selection, action): boolean? -- see "Customizing selection"
   debug = { enabled = false, show_scores = false },
   logging = {
     enabled = true,
@@ -272,6 +273,63 @@ require('fff').setup({
 ```
 
 Set `suggestions.file_to_grep = false` if you want the file picker to stop falling back to content grep suggestions on zero-result queries.
+
+### Customizing selection (`on_select`)
+
+Pass an `on_select` function in `setup({...})` (or per call in `find_files(opts)` / `live_grep(opts)`) to take over what happens when the user picks an item. fff still handles everything up to the moment of selection — resolving the path, closing the picker, recording history — and then invokes your hook.
+
+Signature:
+
+```lua
+---@param selection { path: string, relative_path: string, item: table, location: table|nil, query: string, mode: string|nil }
+---@param action 'edit'|'split'|'vsplit'|'tab'
+---@return boolean? handled  -- `true` => fff skips its default :edit/:split/:vsplit/:tabedit and jump
+```
+
+Return `true` when your hook fully handled the selection. Return `false`/`nil` (or nothing) to let fff's default behavior run after your hook.
+
+Example — avoid `:E1513` by never opening into a `'winfixbuf'` window:
+
+```lua
+require('fff').setup({
+  on_select = function(sel, action)
+    if action ~= 'edit' then return false end -- let fff handle split/vsplit/tab
+
+    local function usable(win)
+      if not vim.api.nvim_win_is_valid(win) then return false end
+      local ok, fixed = pcall(vim.api.nvim_get_option_value, 'winfixbuf', { win = win })
+      if ok and fixed then return false end
+      local buf = vim.api.nvim_win_get_buf(win)
+      local bt  = vim.api.nvim_get_option_value('buftype',    { buf = buf })
+      local md  = vim.api.nvim_get_option_value('modifiable', { buf = buf })
+      return (bt == '' or bt == 'acwrite') and md
+    end
+
+    local target
+    if usable(vim.api.nvim_get_current_win()) then
+      target = vim.api.nvim_get_current_win()
+    else
+      for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if usable(w) then target = w; break end
+      end
+    end
+
+    if target then
+      vim.api.nvim_set_current_win(target)
+      vim.cmd('edit ' .. vim.fn.fnameescape(sel.relative_path))
+    else
+      vim.cmd('split ' .. vim.fn.fnameescape(sel.relative_path))
+    end
+
+    if sel.location then
+      require('fff.location_utils').jump_to_location(sel.location)
+    end
+    return true
+  end,
+})
+```
+
+Other use cases: send results to the location list, open in a specific split layout, feed a DAP breakpoint, etc.
 
 ### Live grep modes
 

@@ -2470,29 +2470,55 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
-  if action == 'edit' then
-    local current_buf = vim.api.nvim_get_current_buf()
-    local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
-    local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
-
-    -- If current active buffer is not a normal buffer we find a suitable window with a tab otherwise opening a new split
-    if current_buftype ~= '' or not current_buf_modifiable then
-      local suitable_win = find_suitable_window()
-      if suitable_win then vim.api.nvim_set_current_win(suitable_win) end
+  -- User hook: let config.on_select fully handle the selection if it wants to.
+  -- The hook receives a rich selection table plus the action; returning `true`
+  -- suppresses fff's default :edit/:split/:vsplit/:tabedit and jump_to_location.
+  -- History tracking below still runs either way so frecency/combo scoring
+  -- stays consistent regardless of how the file is opened.
+  local user_handled = false
+  local user_on_select = M.state.config and M.state.config.on_select
+  if type(user_on_select) == 'function' then
+    local selection = {
+      path = abs_path,
+      relative_path = relative_path,
+      item = item,
+      location = location,
+      query = query,
+      mode = mode,
+    }
+    local ok_hook, ret = pcall(user_on_select, selection, action)
+    if not ok_hook then
+      vim.notify('FFF: on_select error: ' .. tostring(ret), vim.log.levels.ERROR)
+    else
+      user_handled = ret == true
     end
+  end
 
-    vim.cmd('edit ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'split' then
-    vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'vsplit' then
-    vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'tab' then
-    vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
+  if not user_handled then
+    if action == 'edit' then
+      local current_buf = vim.api.nvim_get_current_buf()
+      local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
+      local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+
+      -- If current active buffer is not a normal buffer we find a suitable window with a tab otherwise opening a new split
+      if current_buftype ~= '' or not current_buf_modifiable then
+        local suitable_win = find_suitable_window()
+        if suitable_win then vim.api.nvim_set_current_win(suitable_win) end
+      end
+
+      vim.cmd('edit ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'split' then
+      vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'vsplit' then
+      vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'tab' then
+      vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
+    end
   end
 
   -- Derive side effects on vim schedule to ensure they run after the file is opened
   vim.schedule(function()
-    if location then location_utils.jump_to_location(location) end
+    if not user_handled and location then location_utils.jump_to_location(location) end
 
     if query and query ~= '' then
       local config = conf.get()
