@@ -9,7 +9,7 @@ use std::time::Duration;
 use clap::Parser;
 use fff_protocol::{
     decode_request, encode_response, socket_path,
-    Request, Response,
+    Request, Response, DAEMON_BIN_NAME,
 };
 use mimalloc::MiMalloc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -99,9 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if pid_path.exists() {
             if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
                 if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                    // SAFETY: kill(pid, 0) only checks process existence, no signal sent
-                    let alive = unsafe { libc::kill(pid, 0) } == 0;
-                    if alive {
+                    if is_running_fff_daemon(pid) {
                         eprintln!("fff-daemon already running (pid {pid})");
                         std::process::exit(1);
                     }
@@ -279,4 +277,49 @@ async fn handle_connection(
 
 fn canonicalize_or_original(path: &Path) -> PathBuf {
     fff::path_utils::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Return true only if `pid` refers to a live (non-zombie) process whose
+/// executable command is `fff-daemon`. `kill(pid, 0) == 0` alone is not
+/// enough: zombies and PID-recycled unrelated processes both satisfy it,
+/// which would make this daemon refuse to start and leave the user
+/// permanently stuck with a stale pid file (observed in practice).
+fn is_running_fff_daemon(pid: i32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    // First, cheap existence + permission probe.
+    // SAFETY: kill(pid, 0) sends no signal; only checks existence/perms.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+
+    // Confirm it's actually an fff-daemon (and not a zombie or a recycled
+    // unrelated PID) by asking `ps` for the command name. Portable across
+    // macOS and Linux, no extra deps.
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output();
+    let comm = match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => return false,
+    };
+    if comm.is_empty() {
+        return false;
+    }
+    // `ps -o comm=` prints the executable path (macOS) or basename (Linux).
+    // Zombies on macOS print `(fff-daemon)` with parens; some systems emit
+    // `<defunct>`. Treat both as dead.
+    if comm.starts_with('(') && comm.ends_with(')') {
+        return false;
+    }
+    if comm.contains("<defunct>") || comm.contains("defunct") {
+        return false;
+    }
+    std::path::Path::new(&comm)
+        .file_name()
+        .map(|n| n == DAEMON_BIN_NAME)
+        .unwrap_or(false)
 }
