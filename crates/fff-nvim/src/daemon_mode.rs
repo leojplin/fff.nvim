@@ -6,6 +6,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 static DAEMON_CLIENT: Lazy<Mutex<Option<FffClient>>> = Lazy::new(|| Mutex::new(None));
+/// `init_db` args received before `init_file_picker` has connected a client.
+/// Replayed on the first connection, and stored inside the client so
+/// subsequent reconnects also replay them.
+static PENDING_INIT_DB: Lazy<Mutex<Option<(String, String, bool)>>> =
+    Lazy::new(|| Mutex::new(None));
 
 fn with_client<F, R>(f: F) -> LuaResult<R>
 where
@@ -24,7 +29,9 @@ pub fn init_db(
     _: &Lua,
     (frecency_db_path, history_db_path, use_unsafe_no_lock): (String, String, bool),
 ) -> LuaResult<bool> {
-    // If client is already connected, forward the init_db call
+    // If client is already connected, forward the init_db call immediately
+    // so the daemon has the DB paths and the client remembers them for
+    // replay after reconnect.
     let mut guard = DAEMON_CLIENT.lock().map_err(|e| {
         LuaError::RuntimeError(format!("failed to lock daemon client: {e}"))
     })?;
@@ -32,8 +39,15 @@ pub fn init_db(
         client
             .init_db(&frecency_db_path, &history_db_path, use_unsafe_no_lock)
             .map_err(|e| LuaError::RuntimeError(format!("daemon error: {e}")))?;
+        return Ok(true);
     }
-    // Otherwise, the daemon will get init_db when we connect
+
+    // No client yet — remember init_db args by connecting lazily.
+    // We can't actually connect without a base_path, so stash the args in a
+    // module-local slot that init_file_picker will replay once it connects.
+    *PENDING_INIT_DB.lock().map_err(|e| {
+        LuaError::RuntimeError(format!("failed to lock pending init_db: {e}"))
+    })? = Some((frecency_db_path, history_db_path, use_unsafe_no_lock));
     Ok(true)
 }
 
@@ -55,6 +69,18 @@ pub fn init_file_picker(
     let mut client = FffClient::connect(Path::new(&base_path)).map_err(|e| {
         LuaError::RuntimeError(format!("failed to connect to daemon: {e}"))
     })?;
+
+    // Replay any init_db that was queued before init_file_picker so the
+    // daemon learns about the DB paths, and so reconnect-replay has it.
+    if let Some((frecency, history, use_unsafe)) = PENDING_INIT_DB
+        .lock()
+        .map_err(|e| LuaError::RuntimeError(format!("failed to lock pending init_db: {e}")))?
+        .take()
+    {
+        client
+            .init_db(&frecency, &history, use_unsafe)
+            .map_err(|e| LuaError::RuntimeError(format!("daemon error: {e}")))?;
+    }
 
     client
         .init_file_picker(&base_path, watch_git_events.unwrap_or(true))

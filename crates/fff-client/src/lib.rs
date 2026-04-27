@@ -11,6 +11,10 @@ pub struct FffClient {
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
     base_path: PathBuf,
+    socket_path: PathBuf,
+    // Replayable setup state so we can transparently reconnect after EPIPE.
+    init_db_args: Option<(String, String, bool)>,
+    init_file_picker_args: Option<(String, bool)>,
 }
 
 #[derive(Debug)]
@@ -63,6 +67,22 @@ impl FffClient {
     }
 
     pub fn connect_to(base_path: &Path, socket_path: &Path) -> Result<Self> {
+        let (reader, writer) = Self::open_streams(socket_path)?;
+        Ok(Self {
+            reader,
+            writer,
+            base_path: base_path.to_path_buf(),
+            socket_path: socket_path.to_path_buf(),
+            init_db_args: None,
+            init_file_picker_args: None,
+        })
+    }
+
+    /// Open a fresh framed UnixStream pair to the daemon, spawning the
+    /// daemon if the socket is missing.
+    fn open_streams(
+        socket_path: &Path,
+    ) -> Result<(BufReader<UnixStream>, BufWriter<UnixStream>)> {
         let stream = match UnixStream::connect(socket_path) {
             Ok(s) => s,
             Err(e)
@@ -82,12 +102,7 @@ impl FffClient {
 
         let reader = BufReader::new(stream.try_clone()?);
         let writer = BufWriter::new(stream);
-
-        Ok(Self {
-            reader,
-            writer,
-            base_path: base_path.to_path_buf(),
-        })
+        Ok((reader, writer))
     }
 
     fn spawn_daemon(socket_path: &Path) -> Result<()> {
@@ -104,6 +119,20 @@ impl FffClient {
         cmd.arg("--foreground")
             .arg("--socket")
             .arg(socket_path);
+
+        // Opt-in daemon-side logging for debugging. Set FFF_DAEMON_LOG=<path>
+        // to collect daemon tracing (default info level, or override via
+        // FFF_DAEMON_LOG_LEVEL=debug).
+        if let Ok(log_path) = std::env::var("FFF_DAEMON_LOG") {
+            if !log_path.is_empty() {
+                cmd.arg("--log-file").arg(&log_path);
+                let level = std::env::var("FFF_DAEMON_LOG_LEVEL")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "debug".to_string());
+                cmd.arg("--log-level").arg(level);
+            }
+        }
 
         // Detach the daemon process
         unsafe {
@@ -190,6 +219,19 @@ impl FffClient {
     }
 
     fn send(&mut self, request: &Request) -> Result<Response> {
+        match self.send_once(request) {
+            Err(ClientError::Io(e)) if is_disconnect(&e) => {
+                // Socket died between requests (daemon was restarted,
+                // killed, or closed our connection). Reconnect transparently
+                // and replay the one request the caller is making.
+                self.reconnect_and_replay_setup()?;
+                self.send_once(request)
+            }
+            other => other,
+        }
+    }
+
+    fn send_once(&mut self, request: &Request) -> Result<Response> {
         let data = encode_request(request)?;
         write_frame(&mut self.writer, &data)?;
         let resp_data = read_frame(&mut self.reader)?;
@@ -198,6 +240,32 @@ impl FffClient {
             return Err(ClientError::DaemonError(msg.clone()));
         }
         Ok(response)
+    }
+
+    /// Tear down the current socket and open a new one, then replay the
+    /// minimum setup needed to restore server-side per-connection state.
+    /// Safe to call repeatedly; all replayed handlers on the daemon are
+    /// idempotent.
+    fn reconnect_and_replay_setup(&mut self) -> Result<()> {
+        let (reader, writer) = Self::open_streams(&self.socket_path)?;
+        self.reader = reader;
+        self.writer = writer;
+
+        if let Some((frecency, history, use_unsafe)) = self.init_db_args.clone() {
+            // Replay directly via send_once so we don't recurse into send().
+            let _ = self.send_once(&Request::InitDb {
+                frecency_db_path: frecency,
+                history_db_path: history,
+                use_unsafe_no_lock: use_unsafe,
+            })?;
+        }
+        if let Some((base_path, watch_git)) = self.init_file_picker_args.clone() {
+            let _ = self.send_once(&Request::IndexDirectory {
+                path: PathBuf::from(base_path),
+                watch_git_events: watch_git,
+            })?;
+        }
+        Ok(())
     }
 
     // -- Public API matching fff-nvim's Lua-callable functions --
@@ -213,6 +281,11 @@ impl FffClient {
             history_db_path: history_db_path.to_string(),
             use_unsafe_no_lock,
         })?;
+        self.init_db_args = Some((
+            frecency_db_path.to_string(),
+            history_db_path.to_string(),
+            use_unsafe_no_lock,
+        ));
         match resp {
             Response::Bool(b) => Ok(b),
             _ => Ok(true),
@@ -229,6 +302,7 @@ impl FffClient {
             path: PathBuf::from(base_path),
             watch_git_events,
         })?;
+        self.init_file_picker_args = Some((base_path.to_string(), watch_git_events));
         match resp {
             Response::Bool(b) => Ok(b),
             _ => Ok(true),
@@ -242,6 +316,11 @@ impl FffClient {
             path: old_path,
             new_path: PathBuf::from(new_path),
         })?;
+        // After a successful restart the picker's tracked base path is now
+        // `new_path`; update replay args so reconnect picks the right dir.
+        if let Some((_, watch_git)) = self.init_file_picker_args {
+            self.init_file_picker_args = Some((new_path.to_string(), watch_git));
+        }
         Ok(())
     }
 
@@ -512,3 +591,21 @@ impl FffClient {
     }
 }
 
+/// Treat these kinds as a dead-connection signal, meaning the fff-daemon
+/// went away (crashed, was killed, got EPIPE while writing to us, etc.).
+/// We transparently reconnect once and retry the request so a stale
+/// cached `FffClient` doesn't permanently break frecency tracking or
+/// `restart_index_in_path` for the rest of the Neovim session.
+fn is_disconnect(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NotFound // socket file disappeared
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    )
+}
