@@ -46,6 +46,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@ff-labs/fff-bin-darwin-arm64": "^0.8.1",
     "@ff-labs/fff-node": "*"
   },
   "peerDependencies": {
