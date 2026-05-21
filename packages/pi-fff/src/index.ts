@@ -1,23 +1,12 @@
 /**
- * pi-fff: FFF-powered file search extension for pi
+ * pi-fff: FFF-powered file search extension for OMP
  *
- * Overrides built-in `find` and `grep` tools with FFF and can also replace
- * @-mention autocomplete suggestions in the interactive editor.
+ * Registers FFF-powered find, grep, and multi-grep tools.
+ * Ported from @mariozechner/pi-fff to @oh-my-pi (OMP).
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import {
-  CustomEditor,
-  truncateHead,
-  DEFAULT_MAX_BYTES,
-  formatSize,
-} from "@mariozechner/pi-coding-agent";
-import {
-  Text,
-  type AutocompleteItem,
-  type AutocompleteProvider,
-} from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { Text } from "@oh-my-pi/pi-tui";
 import { FileFinder } from "@ff-labs/fff-node";
 import type {
   GrepCursor,
@@ -26,6 +15,7 @@ import type {
   SearchResult,
   MixedItem,
 } from "@ff-labs/fff-node";
+import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -39,6 +29,9 @@ const MENTION_MAX_RESULTS = 20;
 type FffMode = "tools-and-ui" | "tools-only" | "override";
 
 const VALID_MODES: FffMode[] = ["tools-and-ui", "tools-only", "override"];
+
+const HOT_FRECENCY = 25;
+const WARM_FRECENCY = 20;
 
 interface ToolNames {
   grep: string;
@@ -82,6 +75,31 @@ function getCursor(id: string): GrepCursor | undefined {
   return cursorCache.get(id);
 }
 
+// Find pagination uses a page-index cursor
+interface FindCursor {
+  query: string;
+  pattern: string;
+  pageSize: number;
+  nextPageIndex: number;
+}
+
+const findCursorCache = new Map<string, FindCursor>();
+let findCursorCounter = 0;
+
+function storeFindCursor(cursor: FindCursor): string {
+  const id = `${++findCursorCounter}`;
+  findCursorCache.set(id, cursor);
+  if (findCursorCache.size > 200) {
+    const first = findCursorCache.keys().next().value;
+    if (first) findCursorCache.delete(first);
+  }
+  return id;
+}
+
+function getFindCursor(id: string): FindCursor | undefined {
+  return findCursorCache.get(id);
+}
+
 // ---------------------------------------------------------------------------
 // Output formatting helpers
 // ---------------------------------------------------------------------------
@@ -91,44 +109,90 @@ function truncateLine(line: string, max = GREP_MAX_LINE_LENGTH): string {
   return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max)}...`;
 }
 
-function formatGrepOutput(result: GrepResult, limit: number): string {
-  const items = result.items.slice(0, limit);
-  if (items.length === 0) return "No matches found";
+export function fffFileAnnotation(item: {
+  gitStatus?: string;
+  totalFrecencyScore?: number;
+  accessFrecencyScore?: number;
+}): string {
+  const git = item.gitStatus;
+  if (git && git !== "clean" && git !== "unknown" && git !== "") {
+    return `  [${git} in git]`;
+  }
+
+  const frecency = item.totalFrecencyScore ?? item.accessFrecencyScore ?? 0;
+  if (frecency >= HOT_FRECENCY) return "  [VERY often touched file]";
+  if (frecency >= WARM_FRECENCY) return "  [often touched file]";
+
+  return "";
+}
+
+function formatGrepOutput(result: GrepResult): string {
+  if (result.items.length === 0) return "No matches found";
 
   const lines: string[] = [];
   let currentFile = "";
+  let shown = 0;
 
-  for (const match of items) {
+  for (const match of result.items) {
     if (match.relativePath !== currentFile) {
-      currentFile = match.relativePath;
       if (lines.length > 0) lines.push("");
+      currentFile = match.relativePath;
+      lines.push(`${currentFile}${fffFileAnnotation(match)}`);
     }
 
     match.contextBefore?.forEach((line: string, i: number) => {
-      lines.push(
-        `${match.relativePath}-${match.lineNumber - match.contextBefore!.length + i}- ${truncateLine(line)}`,
-      );
+      const lineNum = match.lineNumber - match.contextBefore!.length + i;
+      lines.push(` ${lineNum}- ${truncateLine(line)}`);
     });
 
-    lines.push(
-      `${match.relativePath}:${match.lineNumber}: ${truncateLine(match.lineContent)}`,
-    );
+    lines.push(` ${match.lineNumber}: ${truncateLine(match.lineContent)}`);
+    shown++;
 
     match.contextAfter?.forEach((line: string, i: number) => {
-      lines.push(
-        `${match.relativePath}-${match.lineNumber + 1 + i}- ${truncateLine(line)}`,
-      );
+      const lineNum = match.lineNumber + 1 + i;
+      lines.push(` ${lineNum}- ${truncateLine(line)}`);
     });
   }
 
   return lines.join("\n");
 }
 
-function formatFindOutput(result: SearchResult, limit: number): string {
-  const items = result.items.slice(0, limit);
-  return items.length === 0
-    ? "No files found matching pattern"
-    : items.map((i: { relativePath: string }) => i.relativePath).join("\n");
+const FIND_WEAK_SAMPLE_SIZE = 5;
+
+function weakScoreThreshold(pattern: string): number {
+  const perfect = pattern.length * 12;
+  return Math.floor((perfect * 50) / 100);
+}
+
+interface FormattedFind {
+  output: string;
+  weak: boolean;
+  shownCount: number;
+}
+
+function formatFindOutput(
+  result: SearchResult,
+  limit: number,
+  pattern: string,
+): FormattedFind {
+  if (result.items.length === 0) {
+    return { output: "No files found matching pattern", weak: false, shownCount: 0 };
+  }
+
+  const reordered = result.items.map((item) => ({ item }));
+
+  const topScore = result.scores[0]?.total ?? 0;
+  const weak = topScore < weakScoreThreshold(pattern);
+  const effective = weak ? Math.min(FIND_WEAK_SAMPLE_SIZE, limit) : limit;
+  const shown = reordered.slice(0, effective);
+
+  return {
+    output: shown
+      .map((p) => `${p.item.relativePath}${fffFileAnnotation(p.item)}`)
+      .join("\n"),
+    weak,
+    shownCount: shown.length,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -144,97 +208,6 @@ function buildAtCompletionValue(path: string): string {
   return path.includes(" ") ? `@"${path}"` : `@${path}`;
 }
 
-function createFffMentionProvider(
-  getItems: (query: string, signal: AbortSignal) => Promise<AutocompleteItem[]>,
-): AutocompleteProvider {
-  return {
-    async getSuggestions(lines, cursorLine, cursorCol, options) {
-      const currentLine = lines[cursorLine] || "";
-      const prefix = extractAtPrefix(currentLine.slice(0, cursorCol));
-      if (!prefix || options.signal.aborted) return null;
-
-      const query = prefix.startsWith('@"') ? prefix.slice(2) : prefix.slice(1);
-      const items = await getItems(query, options.signal);
-      return options.signal.aborted || items.length === 0 ? null : { items, prefix };
-    },
-    applyCompletion(_lines, cursorLine, cursorCol, item, prefix) {
-      const currentLine = _lines[cursorLine] || "";
-      const before = currentLine.slice(0, cursorCol - prefix.length);
-      const after = currentLine.slice(cursorCol);
-      const newLine = before + item.value + after;
-      const newCursorCol = cursorCol - prefix.length + item.value.length;
-      return {
-        lines: [..._lines.slice(0, cursorLine), newLine, ..._lines.slice(cursorLine + 1)],
-        cursorLine,
-        cursorCol: newCursorCol,
-      };
-    },
-  };
-}
-
-// Simple editor wrapper that injects FFF @-mention autocomplete alongside base provider
-class FffEditor extends CustomEditor {
-  private baseProvider: AutocompleteProvider | undefined;
-  private getMentionItems: (
-    query: string,
-    signal: AbortSignal,
-  ) => Promise<AutocompleteItem[]>;
-
-  constructor(
-    tui: any,
-    theme: any,
-    keybindings: any,
-    getMentionItems: (query: string, signal: AbortSignal) => Promise<AutocompleteItem[]>,
-  ) {
-    super(tui, theme, keybindings);
-    this.getMentionItems = getMentionItems;
-  }
-
-  override setAutocompleteProvider(provider: AutocompleteProvider): void {
-    this.baseProvider = provider;
-    // Create composite provider that handles @-mentions and falls back to base
-    const mentionProvider = createFffMentionProvider(this.getMentionItems);
-    const compositeProvider: AutocompleteProvider = {
-      getSuggestions: async (lines, cursorLine, cursorCol, options) => {
-        // Try @-mention first
-        const mentionResult = await mentionProvider.getSuggestions(
-          lines,
-          cursorLine,
-          cursorCol,
-          options,
-        );
-        if (mentionResult) return mentionResult;
-        // Fall back to base provider
-        return (
-          this.baseProvider?.getSuggestions(lines, cursorLine, cursorCol, options) ?? null
-        );
-      },
-      applyCompletion: (lines, cursorLine, cursorCol, item, prefix) => {
-        // Let mention provider handle @ completions, base provider for others
-        if (prefix?.startsWith("@")) {
-          return mentionProvider.applyCompletion!(
-            lines,
-            cursorLine,
-            cursorCol,
-            item,
-            prefix,
-          );
-        }
-        return (
-          this.baseProvider?.applyCompletion?.(
-            lines,
-            cursorLine,
-            cursorCol,
-            item,
-            prefix,
-          ) ?? { lines, cursorLine, cursorCol }
-        );
-      },
-    };
-    super.setAutocompleteProvider(compositeProvider);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -242,6 +215,7 @@ class FffEditor extends CustomEditor {
 export default function fffExtension(pi: ExtensionAPI) {
   let finder: FileFinder | null = null;
   let finderCwd: string | null = null;
+  let finderPromise: Promise<FileFinder> | null = null;
   let activeCwd = process.cwd();
 
   // Mode resolution: flag > env > default
@@ -270,31 +244,37 @@ export default function fffExtension(pi: ExtensionAPI) {
     currentMode = mode;
   }
 
-  function shouldEnableMentions(): boolean {
-    return currentMode !== "tools-only";
-  }
+  function ensureFinder(cwd: string): Promise<FileFinder> {
+    if (finder && !finder.isDestroyed && finderCwd === cwd)
+      return Promise.resolve(finder);
+    if (finderPromise) return finderPromise;
 
-  async function ensureFinder(cwd: string): Promise<FileFinder> {
-    if (finder && !finder.isDestroyed && finderCwd === cwd) return finder;
-    if (finder && !finder.isDestroyed) {
-      finder.destroy();
-      finder = null;
-      finderCwd = null;
-    }
+    finderPromise = (async () => {
+      if (finder && !finder.isDestroyed) {
+        finder.destroy();
+        finder = null;
+        finderCwd = null;
+      }
 
-    const result = FileFinder.create({
-      basePath: cwd,
-      frecencyDbPath,
-      historyDbPath,
-      aiMode: true,
+      const result = FileFinder.create({
+        basePath: cwd,
+        frecencyDbPath,
+        historyDbPath,
+        aiMode: true,
+      });
+
+      if (!result.ok)
+        throw new Error(`Failed to create FFF file finder: ${result.error}`);
+
+      finder = result.value;
+      finderCwd = cwd;
+      await finder.waitForScan(15000);
+      return finder;
+    })().finally(() => {
+      finderPromise = null;
     });
 
-    if (!result.ok) throw new Error(`Failed to create FFF file finder: ${result.error}`);
-
-    finder = result.value;
-    finderCwd = cwd;
-    await finder.waitForScan(15000);
-    return finder;
+    return finderPromise;
   }
 
   function destroyFinder() {
@@ -302,50 +282,6 @@ export default function fffExtension(pi: ExtensionAPI) {
       finder.destroy();
       finder = null;
       finderCwd = null;
-    }
-  }
-
-  async function getMentionItems(
-    query: string,
-    signal: AbortSignal,
-  ): Promise<AutocompleteItem[]> {
-    if (signal.aborted) return [];
-    const f = await ensureFinder(activeCwd);
-    if (signal.aborted) return [];
-
-    const result = f.mixedSearch(query, { pageSize: MENTION_MAX_RESULTS });
-    if (!result.ok) return [];
-
-    return result.value.items.slice(0, MENTION_MAX_RESULTS).map((mixed: MixedItem) => {
-      if (mixed.type === "directory") {
-        return {
-          value: buildAtCompletionValue(mixed.item.relativePath),
-          label: mixed.item.dirName,
-          description: mixed.item.relativePath,
-        };
-      }
-      return {
-        value: buildAtCompletionValue(mixed.item.relativePath),
-        label: mixed.item.fileName,
-        description: mixed.item.relativePath,
-      };
-    });
-  }
-
-  function applyEditorMode(ctx: {
-    ui: {
-      setEditorComponent: (
-        factory: ((tui: any, theme: any, keybindings: any) => any) | undefined,
-      ) => void;
-    };
-  }) {
-    if (!shouldEnableMentions()) {
-      ctx.ui.setEditorComponent(undefined);
-    } else {
-      ctx.ui.setEditorComponent(
-        (tui: any, theme: any, keybindings: any) =>
-          new FffEditor(tui, theme, keybindings, getMentionItems),
-      );
     }
   }
 
@@ -370,7 +306,6 @@ export default function fffExtension(pi: ExtensionAPI) {
     try {
       activeCwd = ctx.cwd;
       await ensureFinder(activeCwd);
-      applyEditorMode(ctx);
     } catch (e: unknown) {
       ctx.ui.notify(
         `FFF init failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -414,94 +349,132 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   // --- grep tool ---
 
-  const grepSchema = Type.Object({
-    pattern: Type.String({ description: "Search pattern (plain text or regex)" }),
-    path: Type.Optional(
-      Type.String({
-        description:
-          "Directory or file constraint, e.g. 'src/' or '*.ts' (default: project root)",
-      }),
-    ),
-    literal: Type.Optional(
-      Type.Boolean({
-        description: "Treat pattern as literal string instead of regex (default: true)",
-      }),
-    ),
-    context: Type.Optional(
-      Type.Number({
-        description: "Number of lines to show before and after each match (default: 0)",
-      }),
-    ),
-    limit: Type.Optional(
-      Type.Number({
-        description: `Maximum number of matches to return (default: ${DEFAULT_GREP_LIMIT})`,
-      }),
-    ),
-    cursor: Type.Optional(
-      Type.String({ description: "Cursor from previous result for pagination" }),
-    ),
+  const grepSchema = z.object({
+    pattern: z.string().describe("Search pattern (literal text or regex)"),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        "Repo-relative path constraint. Directory prefix (src/ or src/foo/), bare filename with extension (main.rs), or glob (*.ts, src/**/*.cc, {src,lib}/**). Applied to the full repo-relative path.",
+      ),
+    exclude: z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .describe(
+        "Exclude paths (comma/space-separated or array). Same syntax as path: directory prefix ('test/'), filename with extension ('config.json'), or glob ('*.min.js', '**/*.{rs,go}'). A leading '!' is optional and ignored — both 'test/' and '!test/' work. Example: 'test/,*.min.js,!vendor/'.",
+      ),
+    caseSensitive: z
+      .boolean()
+      .optional()
+      .describe(
+        "Force case-sensitive matching. Default uses smart-case (case-insensitive when pattern is all lowercase).",
+      ),
+    context: z.number().optional().describe("Context lines before+after each match"),
+    limit: z
+      .number()
+      .optional()
+      .describe(`Max matches (default ${DEFAULT_GREP_LIMIT})`),
+    cursor: z.string().optional().describe("Pagination cursor from previous result"),
   });
 
   pi.registerTool({
     name: toolNames.grep,
     label: toolNames.grep,
-    description: `Search file contents for a pattern using FFF (fast, frecency-ranked, git-aware). Returns matching lines with file paths and line numbers. Respects .gitignore. Supports plain text, regex, and fuzzy search modes. Smart case by default. Output truncated to ${DEFAULT_GREP_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB.`,
-    promptSnippet:
-      "Search file contents for patterns (FFF: frecency-ranked, git-aware, respects .gitignore)",
+    description: `Grep file contents. Smart-case, auto-detects regex vs literal, git-aware. Results are ranked by frecency (most-accessed files first); matches within a file stay in source order. Default limit ${DEFAULT_GREP_LIMIT}.`,
+    promptSnippet: "Grep contents",
     promptGuidelines: [
-      "Search for bare identifiers (e.g. 'InProgressQuote'), not code syntax or multi-token regex.",
-      "Plain text search is faster and more reliable than regex. Prefer it.",
-      "After 2 grep calls, read the top result file instead of grepping more.",
-      "Use the path parameter for file/directory constraints: '*.ts', 'src/'.",
+      "Prefer bare identifiers as patterns. Literal queries are most efficient.",
+      "Use path for include ('src/', '*.ts') and exclude for noise ('test/,*.min.js').",
+      "caseSensitive: true when you need exact case (smart-case otherwise).",
+      "After 1-2 greps, read the top match instead of more greps.",
     ],
     parameters: grepSchema,
 
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params: z.infer<typeof grepSchema>, signal) {
       if (signal?.aborted) throw new Error("Operation aborted");
 
       const f = await ensureFinder(activeCwd);
       const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_GREP_LIMIT);
-      const query = params.path ? `${params.path} ${params.pattern}` : params.pattern;
-      const mode: GrepMode = params.literal === false ? "regex" : "plain";
+      const query = buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+      const hasRegexSyntax =
+        params.pattern !== params.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      let mode: GrepMode = hasRegexSyntax ? "regex" : "plain";
+      if (mode === "regex") {
+        try {
+          new RegExp(params.pattern);
+        } catch {
+          mode = "plain";
+        }
+      }
+
+      const p = params.pattern.trim();
+      const isWildcardOnly =
+        hasRegexSyntax &&
+        /^(?:[.^$]*(?:[.][*+?]|\*|\+)[.^$]*|[.^$\s]*|\.\*\??|\.\*[+?]?|\.\+\??|\.|\*|\?)$/.test(p);
+
+      if (isWildcardOnly) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Pattern '${params.pattern}' matches everything — grep needs a concrete substring or identifier. Example: \`pattern: 'MyClass'\` or \`pattern: 'export function'\`.`,
+            },
+          ],
+          details: { totalMatched: 0, totalFiles: 0 },
+        };
+      }
+
+      const smartCase = params.caseSensitive !== true;
 
       const grepResult = f.grep(query, {
         mode,
-        smartCase: true,
+        smartCase,
         maxMatchesPerFile: Math.min(effectiveLimit, 50),
         cursor: (params.cursor ? getCursor(params.cursor) : null) ?? null,
         beforeContext: params.context ?? 0,
         afterContext: params.context ?? 0,
+        classifyDefinitions: true,
       });
 
       if (!grepResult.ok) throw new Error(grepResult.error);
 
-      const result = grepResult.value;
-      let output = formatGrepOutput(result, effectiveLimit);
-      const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
-      output = truncation.content;
+      let result = grepResult.value;
+      let fuzzyNotice: string | null = null;
 
+      if (result.items.length === 0 && !params.cursor && mode !== "regex") {
+        const fuzzy = f.grep(params.pattern, {
+          mode: "fuzzy",
+          smartCase,
+          maxMatchesPerFile: Math.min(effectiveLimit, 50),
+          cursor: null,
+          beforeContext: 0,
+          afterContext: 0,
+          classifyDefinitions: true,
+        });
+
+        if (fuzzy.ok && fuzzy.value.items.length > 0) {
+          fuzzyNotice = "0 exact matches. Maybe you meant this?";
+          result = fuzzy.value;
+        }
+      }
+
+      let output = formatGrepOutput(result);
       const notices: string[] = [];
-      if (result.items.length >= effectiveLimit)
-        notices.push(
-          `${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more`,
-        );
-      if (truncation.truncated)
-        notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-      if (result.regexFallbackError)
-        notices.push(`Regex failed: ${result.regexFallbackError}, used literal match`);
-      if (result.nextCursor)
-        notices.push(
-          `More results available. Use cursor="${storeCursor(result.nextCursor)}" to continue`,
-        );
+      if (result.regexFallbackError) {
+        notices.push(`Invalid regex: ${result.regexFallbackError}, used literal match`);
+      }
+      if (result.nextCursor) {
+        notices.push(`Continue with cursor="${storeCursor(result.nextCursor)}"`);
+      }
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
+      if (fuzzyNotice) output = `[${fuzzyNotice}]\n${output}`;
 
       return {
         content: [{ type: "text", text: output }],
         details: {
           totalMatched: result.totalMatched,
           totalFiles: result.totalFiles,
-          truncated: truncation.truncated,
         },
       };
     },
@@ -529,69 +502,102 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   // --- find tool ---
 
-  const findSchema = Type.Object({
-    pattern: Type.String({
-      description:
-        "Fuzzy search query for file names. Supports path prefixes ('src/') and globs ('*.ts').",
-    }),
-    path: Type.Optional(
-      Type.String({ description: "Directory to search in (default: project root)" }),
-    ),
-    limit: Type.Optional(
-      Type.Number({
-        description: `Maximum number of results (default: ${DEFAULT_FIND_LIMIT})`,
-      }),
-    ),
+  const findSchema = z.object({
+    pattern: z
+      .string()
+      .describe(
+        "Fuzzy filename search and glob search. Frecency-ranked, git-aware. Multi-word = narrower (AND) not bound to order, use for multi word related concept search. Prefer this over ls/find/bash as the first exploration step whenever the user names a concept, feature, or symbol — it surfaces the relevant files in one call. Only use ls/read on a directory when you specifically need the alphabetical layout of an unknown repo, or when a concept search returned nothing.",
+      ),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        "Repo-relative path constraint. Directory prefix (src/ or src/foo/), bare filename with extension (main.rs), or glob (*.ts, src/**/*.cc, {src,lib}/**). Applied to the full repo-relative path.",
+      ),
+    exclude: z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .describe(
+        "Exclude paths (comma/space-separated or array). Same syntax as path: directory prefix ('test/'), filename with extension ('config.json'), or glob ('*.min.js', '**/*.{rs,go}'). A leading '!' is optional and ignored — both 'test/' and '!test/' work. Example: 'test/,*.min.js,!vendor/'.",
+      ),
+    limit: z
+      .number()
+      .optional()
+      .describe(`Max results per page (default ${DEFAULT_FIND_LIMIT})`),
+    cursor: z.string().optional().describe("Pagination cursor from previous result"),
   });
 
   pi.registerTool({
     name: toolNames.find,
     label: toolNames.find,
-    description: `Fuzzy file search by name using FFF (fast, frecency-ranked, git-aware). Returns matching file paths relative to project root. Respects .gitignore. Supports fuzzy matching, path prefixes ('src/'), and glob constraints ('*.ts', '**/*.spec.ts'). Output truncated to ${DEFAULT_FIND_LIMIT} results or ${DEFAULT_MAX_BYTES / 1024}KB.`,
-    promptSnippet:
-      "Find files by name (FFF: fuzzy, frecency-ranked, git-aware, respects .gitignore)",
+    description: `Fuzzy path search and glob search. Matches against the whole repo-relative path, not just the filename. Frecency-ranked, git-aware. Multi-word = narrower (AND). Default limit ${DEFAULT_FIND_LIMIT}.`,
+    promptSnippet: "Find files by path or glob",
     promptGuidelines: [
-      "Keep queries short -- prefer 1-2 terms max.",
-      "Multiple words narrow results (waterfall), they are not OR.",
-      "Use this to find files by name. Use grep to search file contents.",
+      "Matches the WHOLE path, not just the filename — `profile` hits `chrome/browser/profiles/x.cc` too.",
+      "Keep queries to 1-2 terms; extra words narrow.",
+      "Use for paths, not content. Use grep for content.",
+      "For exact path matches use a glob in `path` — e.g. path: '**/profile.h' for exact filename, or path: 'src/**/profile.h' scoped to a subtree. Bare patterns are fuzzy.",
+      "To list everything inside a directory, pass path: 'dir/**' with an empty or wildcard pattern instead of using pattern alone.",
+      "Use exclude: 'test/,*.min.js' to cut noise in large repos.",
     ],
     parameters: findSchema,
 
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params: z.infer<typeof findSchema>, signal) {
       if (signal?.aborted) throw new Error("Operation aborted");
 
       const f = await ensureFinder(activeCwd);
-      const effectiveLimit = Math.max(1, params.limit ?? DEFAULT_FIND_LIMIT);
-      const query = params.path ? `${params.path} ${params.pattern}` : params.pattern;
 
-      const searchResult = f.fileSearch(query, { pageSize: effectiveLimit });
+      const resumed = params.cursor ? getFindCursor(params.cursor) : undefined;
+      const effectiveLimit = resumed
+        ? resumed.pageSize
+        : Math.max(1, params.limit ?? DEFAULT_FIND_LIMIT);
+      const query = resumed
+        ? resumed.query
+        : buildQuery(params.path, params.pattern, params.exclude, activeCwd);
+      const pattern = resumed ? resumed.pattern : params.pattern;
+      const pageIndex = resumed?.nextPageIndex ?? 0;
+
+      const searchResult = f.fileSearch(query, {
+        pageIndex,
+        pageSize: effectiveLimit,
+      });
       if (!searchResult.ok) throw new Error(searchResult.error);
 
       const result = searchResult.value;
-      let output = formatFindOutput(result, effectiveLimit);
-      const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
-      output = truncation.content;
+      const formatted = formatFindOutput(result, effectiveLimit, pattern);
+      let output = formatted.output;
+
+      const shownSoFar = pageIndex * effectiveLimit + result.items.length;
+      const hasMore =
+        result.items.length >= effectiveLimit && result.totalMatched > shownSoFar;
 
       const notices: string[] = [];
-      if (result.items.length >= effectiveLimit)
+      if (formatted.weak && formatted.shownCount > 0)
         notices.push(
-          `${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+          `Query "${pattern}" produced only weak scattered fuzzy matches. Output capped at ${formatted.shownCount}/${result.totalMatched}.`,
         );
-      if (truncation.truncated)
-        notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-      if (result.totalMatched > result.items.length)
+
+      if (!formatted.weak && hasMore) {
+        const remaining = result.totalMatched - shownSoFar;
+        const cursorId = storeFindCursor({
+          query,
+          pattern,
+          pageSize: effectiveLimit,
+          nextPageIndex: pageIndex + 1,
+        });
         notices.push(
-          `${result.totalMatched} total matches (${result.totalFiles} indexed files)`,
+          `${remaining} more match${remaining === 1 ? "" : "es"} available. cursor="${cursorId}" to continue`,
         );
+      }
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
-
       return {
         content: [{ type: "text", text: output }],
         details: {
           totalMatched: result.totalMatched,
           totalFiles: result.totalFiles,
-          truncated: truncation.truncated,
+          pageIndex,
+          hasMore,
         },
       };
     },
@@ -607,6 +613,7 @@ export default function fffExtension(pi: ExtensionAPI) {
         theme.fg("toolOutput", ` in ${path}`);
       if (args?.limit !== undefined)
         content += theme.fg("toolOutput", ` (limit ${args.limit})`);
+      if (args?.cursor) content += theme.fg("muted", ` (page)`);
       text.setText(content);
       return text;
     },
@@ -618,48 +625,28 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   // --- multi_grep tool ---
 
-  const multiGrepSchema = Type.Object({
-    patterns: Type.Array(Type.String(), {
-      description:
-        "Patterns to search for (OR logic -- matches lines containing ANY pattern). Include all naming conventions: snake_case, PascalCase, camelCase.",
-    }),
-    constraints: Type.Optional(
-      Type.String({
-        description:
-          "File constraints, e.g. '*.{ts,tsx} !test/' to filter files. Separate from patterns.",
-      }),
-    ),
-    context: Type.Optional(
-      Type.Number({
-        description: "Number of context lines before and after each match (default: 0)",
-      }),
-    ),
-    limit: Type.Optional(
-      Type.Number({
-        description: `Maximum number of matches to return (default: ${DEFAULT_GREP_LIMIT})`,
-      }),
-    ),
-    cursor: Type.Optional(
-      Type.String({ description: "Cursor from previous result for pagination" }),
-    ),
+  const multiGrepSchema = z.object({
+    patterns: z.array(z.string()).describe("Literal patterns (OR). Include snake_case/camelCase/PascalCase variants."),
+    constraints: z.string().optional().describe("File filter, e.g. '*.{ts,tsx} !test/'"),
+    context: z.number().optional().describe("Context lines before+after"),
+    limit: z.number().optional().describe(`Max matches (default ${DEFAULT_GREP_LIMIT})`),
+    cursor: z.string().optional().describe("Pagination cursor"),
   });
 
   pi.registerTool({
     name: toolNames.multiGrep,
     label: toolNames.multiGrep,
     description:
-      "Search file contents for lines matching ANY of multiple patterns (OR logic). Uses SIMD-accelerated Aho-Corasick multi-pattern matching. Faster than regex alternation. Patterns are literal text -- never escape special characters. Use the constraints parameter for file filtering ('*.rs', 'src/', '!test/').",
-    promptSnippet:
-      "Multi-pattern OR search across file contents (FFF: SIMD-accelerated, frecency-ranked)",
+      "Search file contents for ANY of multiple literal patterns (OR, SIMD Aho-Corasick). Faster than regex alternation.",
+    promptSnippet: "Multi-pattern OR content search",
     promptGuidelines: [
-      `Use ${toolNames.multiGrep} when you need to find multiple identifiers at once (OR logic).`,
-      "Include all naming conventions: snake_case, PascalCase, camelCase variants.",
-      "Patterns are literal text. Never escape special characters.",
-      "Use the constraints parameter for file type/path filtering, not inside patterns.",
+      "Use when searching for several identifiers at once.",
+      "Include all naming-convention variants (snake/camel/Pascal).",
+      "Patterns are literal. Use constraints for file filters.",
     ],
     parameters: multiGrepSchema,
 
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params: z.infer<typeof multiGrepSchema>, signal) {
       if (signal?.aborted) throw new Error("Operation aborted");
       if (!params.patterns?.length)
         throw new Error("patterns array must have at least 1 element");
@@ -680,20 +667,14 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (!grepResult.ok) throw new Error(grepResult.error);
 
       const result = grepResult.value;
-      let output = formatGrepOutput(result, effectiveLimit);
-      const truncation = truncateHead(output, { maxLines: Number.MAX_SAFE_INTEGER });
-      output = truncation.content;
+      let output = formatGrepOutput(result);
 
       const notices: string[] = [];
       if (result.items.length >= effectiveLimit)
-        notices.push(
-          `${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more`,
-        );
-      if (truncation.truncated)
-        notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+        notices.push(`${effectiveLimit}+ matches (refine patterns)`);
       if (result.nextCursor)
         notices.push(
-          `More results available. Use cursor="${storeCursor(result.nextCursor)}" to continue`,
+          `More available. cursor="${storeCursor(result.nextCursor)}" to continue`,
         );
 
       if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
@@ -703,7 +684,6 @@ export default function fffExtension(pi: ExtensionAPI) {
         details: {
           totalMatched: result.totalMatched,
           totalFiles: result.totalFiles,
-          truncated: truncation.truncated,
           patterns: params.patterns,
         },
       };
@@ -735,7 +715,6 @@ export default function fffExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const arg = (args || "").trim();
 
-      // No args - show current mode
       if (!arg) {
         const mode = getMode();
         const flag = pi.getFlag("fff-mode") ?? "unset";
@@ -744,7 +723,6 @@ export default function fffExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Validate and set mode
       if (!VALID_MODES.includes(arg as FffMode)) {
         ctx.ui.notify(`Usage: /fff-mode [${VALID_MODES.join(" | ")}]`, "warning");
         return;
@@ -753,9 +731,6 @@ export default function fffExtension(pi: ExtensionAPI) {
       const newMode = arg as FffMode;
       const oldMode = getMode();
       setMode(newMode);
-
-      // Apply immediately using the shared function
-      applyEditorMode(ctx);
 
       const note =
         (oldMode === "override") !== (newMode === "override")
@@ -817,4 +792,35 @@ export default function fffExtension(pi: ExtensionAPI) {
       ctx.ui.notify("FFF rescan triggered", "info");
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Query builder — shared between grep and find
+// ---------------------------------------------------------------------------
+
+function buildQuery(
+  path: string | undefined,
+  pattern: string | undefined,
+  exclude: string | string[] | undefined,
+  cwd: string,
+): string {
+  const parts: string[] = [];
+
+  if (path) {
+    parts.push(path);
+  }
+
+  if (pattern) {
+    parts.push(pattern);
+  }
+
+  if (exclude) {
+    const exclusions = Array.isArray(exclude) ? exclude : exclude.split(/[,\s]+/).filter(Boolean);
+    for (const ex of exclusions) {
+      const cleaned = ex.startsWith("!") ? ex : `!${ex}`;
+      parts.push(cleaned);
+    }
+  }
+
+  return parts.join(" ");
 }

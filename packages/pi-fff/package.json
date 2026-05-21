@@ -1,23 +1,25 @@
 {
   "name": "@ff-labs/pi-fff",
   "public": true,
-  "version": "0.6.0",
-  "description": "pi extension: FFF-powered fuzzy file and content search",
+  "version": "0.6.0-omp.1",
+  "description": "OMP extension: FFF-powered fuzzy file and content search",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dmtrKovalenko/fff.nvim.git",
+    "url": "git+https://github.com/leojplin/fff.nvim.git",
     "directory": "packages/pi-fff"
   },
-  "homepage": "https://github.com/dmtrKovalenko/fff.nvim/tree/main/packages/pi-fff",
+  "homepage": "https://github.com/leojplin/fff.nvim/tree/main/packages/pi-fff",
   "bugs": {
-    "url": "https://github.com/dmtrKovalenko/fff.nvim/issues"
+    "url": "https://github.com/leojplin/fff.nvim/issues"
   },
   "keywords": [
+    "omp",
     "pi",
     "pi-package",
     "pi-extension",
+    "omp-extension",
     "fff",
     "search",
     "grep",
@@ -25,6 +27,11 @@
     "ai-agent"
   ],
   "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "omp": {
     "extensions": [
       "./src/index.ts"
     ]
@@ -42,9 +49,9 @@
     "@ff-labs/fff-node": "*"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@oh-my-pi/pi-coding-agent": "*",
+    "@oh-my-pi/pi-tui": "*",
+    "zod": "*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
